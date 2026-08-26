@@ -1,5 +1,5 @@
 /*
- * CI (pronounced "SEE") — passive Wi-Fi echolocation for ESP32-S3
+ * root — passive Wi-Fi echolocation for ESP32-S3
  *
  * Listens in 802.11 promiscuous mode (no association to a foreign AP) and
  * tracks nearby radios by transmitter MAC + RSSI. Serves a live radar
@@ -10,11 +10,11 @@
  *   Libraries: ESPAsyncWebServer, AsyncTCP (ESP32Async)
  *   USB CDC on Boot: Enabled on native-USB S3 boards
  *
- * PlatformIO: open the parent CI/ folder and flash env:esp32-s3-devkitc-1
+ * PlatformIO: open the parent root/ folder and flash env:esp32-s3-n16r8
  *
  * After flash:
- *   1. Serial Monitor @ 115200 — watch "CI ping:" lines
- *   2. Join Wi-Fi  SSID: CI-SEE   password: see-ci-radar
+ *   1. Serial Monitor @ 115200 — watch "root ping:" lines
+ *   2. Join Wi-Fi  SSID: root   password: root-radar
  *   3. Open http://192.168.4.1
  *
  * This firmware is receive-only. It does not inject frames, deauth, or join
@@ -37,8 +37,8 @@
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
-static const char* AP_SSID = "CI-SEE";
-static const char* AP_PASS = "see-ci-radar";  // 8+ chars; "" for an open AP
+static const char* AP_SSID = "root";
+static const char* AP_PASS = "root-radar";  // 8+ chars; "" for an open AP
 static const uint8_t AP_CHANNEL = 6;
 static const uint8_t MAX_DEVICES = 64;
 static const uint32_t STALE_MS = 30000;
@@ -269,7 +269,7 @@ static void ingestHit(const SniffHit& hit) {
   xSemaphoreGive(gMux);
 
   if (shouldPing) {
-    Serial.printf("CI ping: [%s] | RSSI: %d dBm | Distance: ~%.1fm\n",
+    Serial.printf("root ping: [%s] | RSSI: %d dBm | Distance: ~%.1fm\n",
                   macbuf, (int)hit.rssi, dist);
     triggerPingLed();
   }
@@ -332,7 +332,7 @@ static size_t buildJson() {
 
   char tmp[192];
   snprintf(tmp, sizeof(tmp),
-           "{\"name\":\"CI\",\"uptime_ms\":%lu,\"channel\":%u,\"hopping\":%s,"
+           "{\"name\":\"root\",\"uptime_ms\":%lu,\"channel\":%u,\"hopping\":%s,"
            "\"stations\":%u,\"count\":%u,\"devices\":[",
            (unsigned long)now, (unsigned)gChannel, gHopEnable ? "true" : "false",
            (unsigned)WiFi.softAPgetStationNum(), (unsigned)n);
@@ -364,7 +364,7 @@ static void serviceHop() {
   if (!gHopEnable) return;
   if (WiFi.softAPgetStationNum() > 0) return;  // freeze so the dashboard client stays associated
   const uint32_t now = millis();
-  // Linger on the home AP channel so phones can find SSID CI-SEE while hopping.
+  // Linger on the home AP channel so phones can find SSID root while hopping.
   const uint32_t dwell = (gChannel == AP_CHANNEL) ? 1200 : HOP_DWELL_MS;
   if (now - gLastHopMs < dwell) return;
   gLastHopMs = now;
@@ -390,7 +390,7 @@ static void serviceLed() {
   gLastLedMs = now;
 
   if (!gPingActive) {
-    // Quiet phosphor idle so you know CI is alive.
+    // Quiet phosphor idle so you know root is alive.
     const float b = 0.35f + 0.25f * sinf((now / 1000.0f) * 2.0f);
     uint8_t g = (uint8_t)(b * 18.0f);
     ledWrite(0, g, g / 3);
@@ -436,14 +436,14 @@ static void startRadio() {
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_channel(AP_CHANNEL, WIFI_SECOND_CHAN_NONE);
 
-  Serial.println(ok ? "CI: SoftAP up" : "CI: SoftAP failed");
-  Serial.printf("CI: join '%s'  then open http://%s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
+  Serial.println(ok ? "root: SoftAP up" : "root: SoftAP failed");
+  Serial.printf("root: join '%s'  then open http://%s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
 
   char m1[18], m2[18];
   macStr(gSelfMac, m1, sizeof(m1));
   macStr(gApMac, m2, sizeof(m2));
-  Serial.printf("CI: self MAC %s  AP MAC %s\n", m1, m2);
-  Serial.println("CI: promiscuous listen armed — waiting for pings");
+  Serial.printf("root: self MAC %s  AP MAC %s\n", m1, m2);
+  Serial.println("root: promiscuous listen armed — waiting for pings");
 }
 
 static void startWeb() {
@@ -482,7 +482,7 @@ static void startWeb() {
   });
 
   gServer.onNotFound([](AsyncWebServerRequest* req) {
-    req->send(404, "text/plain", "CI: not found");
+    req->send(404, "text/plain", "root: not found");
   });
 
   gServer.begin();
@@ -494,7 +494,7 @@ void setup() {
   delay(400);
   Serial.println();
   Serial.println("========================================");
-  Serial.println("  CI  (SEE)  — passive Wi-Fi echolocation");
+  Serial.println("  root  — passive Wi-Fi echolocation");
   Serial.println("========================================");
 
   memset(gDev, 0, sizeof(gDev));
@@ -502,7 +502,7 @@ void setup() {
   gJsonMux = xSemaphoreCreateMutex();
   gQueue = xQueueCreate(QUEUE_LEN, sizeof(SniffHit));
   if (!gMux || !gJsonMux || !gQueue) {
-    Serial.println("CI: failed to allocate queue/mutex");
+    Serial.println("root: failed to allocate queue/mutex");
     return;
   }
 

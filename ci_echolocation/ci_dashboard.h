@@ -1,5 +1,5 @@
 #pragma once
-// CI dashboard — served from PROGMEM at GET /
+// root dashboard — served from PROGMEM at GET /
 // Keep the closing raw-literal tag out of this file's JavaScript.
 
 static const char DASHBOARD_HTML[] PROGMEM = R"HTML(
@@ -8,7 +8,7 @@ static const char DASHBOARD_HTML[] PROGMEM = R"HTML(
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>CI — SEE</title>
+<title>root</title>
 <style>
   :root {
     --bg: #070b10;
@@ -81,7 +81,7 @@ static const char DASHBOARD_HTML[] PROGMEM = R"HTML(
 <body>
 <header>
   <div class="brand">
-    <h1>CI</h1>
+    <h1>root</h1>
     <div class="see">see</div>
   </div>
   <div class="meta">
@@ -117,7 +117,7 @@ static const char DASHBOARD_HTML[] PROGMEM = R"HTML(
     </table>
   </section>
 </main>
-<footer>CI listens in promiscuous mode. Distances are RSSI estimates, not ranging. Use only on networks and premises you are authorized to observe.</footer>
+<footer>root listens in promiscuous mode. Distances are RSSI estimates, not ranging. Use only on networks and premises you are authorized to observe.</footer>
 <script>
 const canvas = document.getElementById("radar");
 const ctx = canvas.getContext("2d");
