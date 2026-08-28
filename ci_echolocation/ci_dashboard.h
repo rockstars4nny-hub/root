@@ -388,9 +388,45 @@ body{
   transition:opacity .2s,transform .2s;font-family:var(--mono);
 }
 .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+
+.use-gate{
+  position:fixed;inset:0;z-index:200;display:flex;align-items:center;justify-content:center;
+  padding:var(--s4);background:rgba(4,6,10,.88);backdrop-filter:blur(10px);
+}
+.use-gate.hide{display:none}
+.use-gate-card{
+  max-width:420px;width:100%;padding:var(--s5);border-radius:var(--radius);
+  background:var(--panel);border:1px solid var(--line);box-shadow:var(--shadow-lg);
+}
+.use-gate-card h2{font-size:var(--t-lg);font-weight:700;margin-bottom:var(--s2);letter-spacing:-.02em}
+.use-gate-card p{font-size:var(--t-sm);color:var(--muted);line-height:1.55;margin-bottom:var(--s3)}
+.use-gate-card ul{font-size:var(--t-sm);color:var(--muted);line-height:1.5;margin:0 0 var(--s4) var(--s4)}
+.use-gate-card li{margin-bottom:var(--s1)}
+.use-gate-actions{display:flex;flex-direction:column;gap:var(--s2)}
+.use-gate-actions .btn{width:100%;justify-content:center;min-height:44px}
+.use-footnote{
+  flex-shrink:0;padding:var(--s1) var(--s4);font-size:10px;color:var(--muted-dim);
+  text-align:center;border-bottom:1px solid var(--line);background:rgba(0,0,0,.15);
+  letter-spacing:.02em;
+}
 </style>
 </head>
 <body>
+
+<div class="use-gate" id="useGate" role="dialog" aria-labelledby="useGateTitle" aria-modal="true">
+  <div class="use-gate-card">
+    <h2 id="useGateTitle">Authorized use only</h2>
+    <p>root is passive RF recon. You may use it only if you have permission.</p>
+    <ul>
+      <li>Your own networks, devices, and property</li>
+      <li>Written authorization from the owner</li>
+      <li>A signed scope (pentest, audit, bug bounty, etc.)</li>
+    </ul>
+    <div class="use-gate-actions">
+      <button type="button" class="btn primary" id="useGateOk">I have permission to use this</button>
+    </div>
+  </div>
+</div>
 
 <header class="topbar">
   <div class="brand">
@@ -417,6 +453,7 @@ body{
     </button>
   </div>
 </header>
+<div class="use-footnote">Passive monitoring only · authorized networks &amp; devices · comply with local RF &amp; privacy laws</div>
 
 <div class="shell">
   <section class="panel on" id="panelRadar">
@@ -504,7 +541,7 @@ body{
     Ch <b id="ch">—</b> · <b id="hop">—</b> · up <b id="up">—</b>
     <select id="chSel"><option value="auto">Auto</option></select>
   </details>
-  <span>root · local only (no internet) · 315/433/868/915 MHz</span>
+  <span>root · local only · authorized use · 315/433/868/915 MHz</span>
 </footer>
 
 <script>
@@ -521,7 +558,18 @@ let scanMeta={channel:null,hopping:null,uptime_ms:0,session_ms:0,name:"root"};
 let whitelist=[],blacklist=[];
 let selectedMac=null,blipAnim={},hitList=[];
 
-const LS_WL="root_wl_v2",LS_BL="root_bl_v2";
+const LS_WL="root_wl_v2",LS_BL="root_bl_v2",LS_USE="root_use_ok_v1";
+function initUseGate(){
+  const gate=document.getElementById("useGate");
+  const btn=document.getElementById("useGateOk");
+  if(!gate||!btn) return;
+  try{if(localStorage.getItem(LS_USE)==="1"){gate.classList.add("hide");return;}}catch(e){}
+  btn.onclick=()=>{
+    try{localStorage.setItem(LS_USE,"1");}catch(e){}
+    gate.classList.add("hide");
+  };
+}
+initUseGate();
 function migrateListKey(oldKey,newKey){
   try{
     const cur=localStorage.getItem(newKey);

@@ -127,6 +127,10 @@ platformio.ini            Build env (default: esp32-s3-n16r8)
 scripts/ch343-attach.sh   WSL USB serial helper
 ```
 
-## License
+## License & authorized use
 
-Firmware in this repo — use and modify for your own kit. Passive monitoring only; comply with local RF and privacy laws.
+**Authorized use only.** Use root on networks, devices, and RF environments you **own** or have **explicit written permission** to monitor (your lab, your home, signed pentest/audit scope, etc.).
+
+Passive monitoring only — comply with local RF, privacy, and computer-access laws. Do not use this tool to intercept communications you are not authorized to observe.
+
+Firmware in this repo — use and modify for your own kit.
