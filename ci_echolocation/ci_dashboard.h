@@ -82,9 +82,15 @@ body{
 .btn svg{width:16px;height:16px;flex-shrink:0}
 
 .shell{grid-row:2;min-height:0;overflow:hidden;display:flex;flex-direction:column}
+@media(max-width:720px){
+  .shell{flex:1;min-height:0}
+  .panel.on{flex:1;min-height:0}
+  #panelList.on .list-scroll{flex:1;min-height:0}
+}
 @media(min-width:721px){
   .shell{display:grid;grid-template-columns:1.05fr .95fr;gap:10px;padding:10px}
   .mob-tabs{display:none!important}
+  .dev-cards{display:grid;grid-template-columns:1fr 1fr;gap:var(--s3);align-content:start}
 }
 .panel{display:none;flex-direction:column;min-height:0;overflow:hidden;background:var(--panel);border:1px solid var(--line);box-shadow:var(--shadow);transition:opacity var(--ease),border-color var(--ease)}
 .panel.on{display:flex}
@@ -141,6 +147,10 @@ body{
 .radar-disclaimer b{color:var(--accent);font-weight:600}
 
 .list-toolbar{flex-shrink:0;padding:var(--s3);border-bottom:1px solid var(--line);display:flex;flex-direction:column;gap:var(--s3);background:rgba(255,255,255,.015)}
+@media(max-width:720px){
+  .list-toolbar{padding:var(--s2) var(--s3);gap:var(--s2)}
+  .lists-box:not([open]){padding:0;border:0}
+}
 .search-wrap{position:relative}
 .search{
   width:100%;padding:var(--s3) var(--s4) var(--s3) 38px;border-radius:var(--radius-sm);border:1px solid var(--line);
@@ -169,14 +179,28 @@ body{
   background:linear-gradient(180deg,rgba(251,146,60,.04),transparent);
   transition:border-color var(--ease),background var(--ease);
 }
+.rf-monitor>summary,.lora-monitor>summary{
+  list-style:none;cursor:pointer;user-select:none;
+}
+.rf-monitor>summary::-webkit-details-marker,.lora-monitor>summary::-webkit-details-marker{display:none}
+.rf-monitor>summary::after,.lora-monitor>summary::after{
+  content:"▾";float:right;color:var(--muted-dim);font-size:10px;transition:transform var(--ease);
+}
+.rf-monitor:not([open])>summary::after,.lora-monitor:not([open])>summary::after{transform:rotate(-90deg)}
+@media(max-width:720px){
+  .rf-monitor,.lora-monitor{padding:var(--s2) var(--s3)}
+  .rf-monitor:not(.on-filter):not([open]),.lora-monitor:not(.on-filter):not([open]){padding-bottom:var(--s2)}
+  .rf-monitor-grid,.lora-monitor-grid{margin-top:var(--s2)}
+}
 .rf-monitor.on-filter{
   border-bottom-color:rgba(251,146,60,.35);
   background:linear-gradient(180deg,rgba(251,146,60,.1),rgba(251,146,60,.02));
 }
 .rf-monitor-title{
   font-size:var(--t-xs);font-weight:700;letter-spacing:.08em;text-transform:uppercase;
-  color:var(--subghz);margin-bottom:var(--s2);
+  color:var(--subghz);margin-bottom:0;
 }
+.rf-monitor[open] .rf-monitor-title,.lora-monitor[open] .lora-monitor-title{margin-bottom:var(--s2)}
 .rf-monitor-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:var(--s2)}
 @media(max-width:520px){.rf-monitor-grid{grid-template-columns:repeat(2,1fr)}}
 .rf-tile{
@@ -200,10 +224,21 @@ body{
 }
 .lora-monitor-title{
   font-size:var(--t-xs);font-weight:700;letter-spacing:.08em;text-transform:uppercase;
-  color:var(--lora);margin-bottom:var(--s2);
+  color:var(--lora);margin-bottom:0;
 }
 .lora-monitor-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:var(--s2)}
-@media(max-width:640px){.lora-monitor-grid{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:720px){
+  .lora-monitor-grid{grid-template-columns:repeat(3,1fr)}
+  .rf-monitor-grid{grid-template-columns:repeat(4,1fr);gap:var(--s1)}
+  .rf-tile,.lora-tile{padding:6px var(--s2)}
+  .rf-tile-v{font-size:var(--t-xs)}
+  .lora-tile-v{font-size:11px}
+  .rf-tile-sub,.lora-tile-sub{font-size:10px;margin-top:2px}
+}
+@media(max-width:400px){
+  .lora-monitor-grid{grid-template-columns:repeat(2,1fr)}
+  .rf-monitor-grid{grid-template-columns:repeat(2,1fr)}
+}
 .lora-tile{
   padding:var(--s2) var(--s3);border-radius:var(--radius-sm);border:1px solid var(--line);
   background:rgba(0,0,0,.22);transition:border-color var(--ease),background var(--ease);
@@ -219,12 +254,27 @@ body{
   border-bottom:1px solid var(--line);letter-spacing:.06em;text-transform:uppercase;font-family:var(--mono);
 }
 .list-scroll{flex:1;min-height:0;overflow:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;padding:var(--s3)}
+@media(max-width:720px){.list-scroll{padding:var(--s2) var(--s3) calc(var(--s2) + env(safe-area-inset-bottom))}}
 
-.dev-cards{display:flex;flex-direction:column;gap:var(--s3)}
+.dev-cards{display:flex;flex-direction:column;gap:var(--s2);align-content:start}
 .dev-card{
   display:flex;align-items:stretch;gap:var(--s2);padding:var(--s3) var(--s4) var(--s3) calc(var(--s4) + 3px);border-radius:var(--radius-sm);
   background:var(--glass);border:1px solid var(--line);transition:border-color var(--ease),background var(--ease),opacity var(--ease),transform 120ms ease;
   position:relative;overflow:hidden;cursor:pointer;flex-direction:column;
+}
+@media(max-width:720px){
+  .dev-card{padding:var(--s2) var(--s3) var(--s2) calc(var(--s3) + 3px);gap:var(--s1)}
+  .dev-summary,.dev-kv-grid{display:none}
+  .dev-card.sel .dev-summary,.dev-card.sel .dev-kv-grid{display:block}
+  .dev-card:not(.sel) .card-actions{
+    flex-direction:row;border:0;margin:0;padding:0;gap:var(--s1);
+  }
+  .dev-card:not(.sel) .card-actions .icon-btn{width:30px;height:30px;min-width:30px}
+  .dev-card:not(.sel) .card-actions .mini{display:none}
+  .dev-top{margin-bottom:0}
+  .dev-mac{margin-bottom:var(--s1);font-size:10px}
+  .dev-name{font-size:var(--t-sm)}
+  .dev-dist{font-size:var(--t-xs)}
 }
 .dev-card:hover{background:rgba(255,255,255,.06);border-color:rgba(255,255,255,.12)}
 .dev-card:focus-within{border-color:var(--accent-dim)}
@@ -232,9 +282,11 @@ body{
   flex-direction:row;flex-wrap:wrap;gap:var(--s2);margin-top:var(--s3);padding-top:var(--s3);border-top:1px solid var(--line);
 }
 .dev-summary{
-  font-size:var(--t-sm);color:var(--muted);line-height:1.4;margin:0 0 var(--s3);
+  font-size:var(--t-sm);color:var(--muted);line-height:1.35;margin:0 0 var(--s2);
   padding:var(--s2) var(--s3);border-radius:var(--radius-sm);background:rgba(0,0,0,.18);border:1px solid var(--line);
 }
+.dev-compact{display:flex;flex-wrap:wrap;gap:4px;align-items:center;margin-top:var(--s1)}
+@media(min-width:721px){.dev-compact{display:none}}
 .dev-kv-grid{
   display:grid;grid-template-columns:minmax(72px,auto) 1fr;gap:var(--s1) var(--s4);
   align-items:baseline;
@@ -307,7 +359,8 @@ body{
 .list-ul li{display:flex;justify-content:space-between;gap:6px;padding:4px 0;border-bottom:1px solid var(--line);font-family:var(--mono);font-size:.7rem}
 .list-ul .rm{color:var(--muted);cursor:pointer;padding:4px}
 
-.empty{padding:40px 20px;text-align:center;color:var(--muted);font-size:.88rem;line-height:1.6}
+.empty{padding:var(--s4) var(--s3);text-align:center;color:var(--muted);font-size:var(--t-sm);line-height:1.5}
+@media(max-width:720px){.empty{padding:var(--s3) var(--s2)}}
 
 .mob-tabs{grid-row:3;display:flex;background:var(--panel);border-top:1px solid var(--line);flex-shrink:0;padding:4px 8px calc(4px + env(safe-area-inset-bottom))}
 .mob-tabs button{
@@ -423,14 +476,14 @@ body{
         </div>
       </details>
     </div>
-    <div class="rf-monitor" id="rfMonitor">
-      <div class="rf-monitor-title">RF Band Monitor</div>
+    <details class="rf-monitor" id="rfMonitor">
+      <summary class="rf-monitor-title">RF Band Monitor</summary>
       <div class="rf-monitor-grid" id="rfMonitorGrid"></div>
-    </div>
-    <div class="lora-monitor" id="loraMonitor">
-      <div class="lora-monitor-title">LR22 LoRa · 915 MHz</div>
+    </details>
+    <details class="lora-monitor" id="loraMonitor">
+      <summary class="lora-monitor-title">LR22 LoRa · 915 MHz</summary>
       <div class="lora-monitor-grid" id="loraMonitorGrid"></div>
-    </div>
+    </details>
     <div class="list-head" id="listHead">passive rf · probe / beacon / data / lora</div>
     <div class="list-scroll" id="list">
       <div class="empty" id="empty">No devices yet — listening on Wi‑Fi, sub‑GHz, and LoRa…</div>
@@ -763,10 +816,21 @@ function renderDeviceCard(d,opts){
   const sel=d.mac===selectedMac?" sel":"";
   const bandCls=d.band==="lora"?" lora":d.band==="subghz"?" subghz":"";
   const macEsc=(d.mac||"").replace(/"/g,"&quot;");
+  const band=d.band||"wifi",kind=d.kind||"?",z=d.zone||"Far";
+  const rssiRaw=d.avg!=null?d.avg:d.rssi;
+  const rssi=Number.isFinite(Number(rssiRaw))?Number(rssiRaw).toFixed(0)+" dBm":"—";
+  const tags=
+    '<span class="tag '+band+'">'+band+'</span>'+
+    '<span class="tag">'+kind+'</span>'+
+    '<span class="tag">'+rssi+'</span>'+
+    '<span class="tag">'+z+'</span>'+
+    (d.ssid&&d.ssid.trim()?'<span class="tag ssid">'+d.ssid.replace(/</g,"&lt;")+'</span>':"");
   return '<div class="dev-card'+tcl+sel+bandCls+'" data-mac="'+macEsc+'">'+
     '<div class="dev-card-main">'+
     '<div class="dev-top"><div class="dev-name">'+plainName(d).replace(/</g,"&lt;")+'</div>'+
     '<div class="dev-dist">~'+Number(d.distance_m||0).toFixed(1)+'m</div></div>'+
+    '<div class="dev-mac">'+(d.mac||"")+'</div>'+
+    '<div class="dev-compact">'+tags+'</div>'+
     '<div class="dev-summary">'+deviceWhatIs(d).replace(/</g,"&lt;")+'</div>'+
     renderDeviceFields(d)+'</div>'+
     '<div class="card-actions">'+
@@ -917,6 +981,7 @@ function renderLoraMonitor(){
   const lo=rfMeta.lora;
   if(!lo||!lo.ready){el.style.display="none";return;}
   el.style.display="block";
+  if(mob()&&!el.hasAttribute("data-touched")&&!activeFilters.has("lora")) el.open=false;
   const pk=Number(lo.packets)||0;
   const uart=Number(lo.uart_bytes)||0;
   const rssi=lo.last_rssi!=null?Number(lo.last_rssi):null;
@@ -936,8 +1001,10 @@ function renderLoraMonitor(){
     '<div class="lora-tile-sub">'+t.sub+'</div></div>').join("");
 }
 function renderRfMonitor(){
+  const el=document.getElementById("rfMonitor");
   const grid=document.getElementById("rfMonitorGrid");
   if(!grid) return;
+  if(el&&mob()&&!el.hasAttribute("data-touched")&&!activeFilters.has("subghz")) el.open=false;
   const tiles=RF_BAND_DEFS.map(b=>({mhz:b.mhz,idx:b.idx,dbm:null,delta:null,live:false,sub:"noise floor"}));
   for(const d of monitorDevices()){
     const i=monitorBandIdx(d);
@@ -1367,9 +1434,15 @@ function renderList(){
   renderRfMonitor();
   renderLoraMonitor();
   const rfMon=document.getElementById("rfMonitor");
-  if(rfMon) rfMon.classList.toggle("on-filter",activeFilters.has("subghz"));
+  if(rfMon){
+    rfMon.classList.toggle("on-filter",activeFilters.has("subghz"));
+    if(mob()&&activeFilters.has("subghz")) rfMon.open=true;
+  }
   const loMon=document.getElementById("loraMonitor");
-  if(loMon) loMon.classList.toggle("on-filter",activeFilters.has("lora"));
+  if(loMon){
+    loMon.classList.toggle("on-filter",activeFilters.has("lora"));
+    if(mob()&&activeFilters.has("lora")) loMon.open=true;
+  }
   if(!displayRows.length){
     cards.innerHTML="";
     empty.style.display="block";
@@ -1522,6 +1595,10 @@ async function poll(){
 }
 pollTimer=setInterval(poll,1500);poll();
 chSel.onchange=()=>fetch("/api/channel?ch="+encodeURIComponent(chSel.value)).catch(()=>{});
+["rfMonitor","loraMonitor"].forEach(id=>{
+  const el=document.getElementById(id);
+  if(el) el.addEventListener("toggle",()=>{if(el.open) el.setAttribute("data-touched","1");});
+});
 setTab(mob()?"radar":"both");
 </script>
 </body>
