@@ -1,0 +1,115 @@
+# root
+
+Passive RF scanner firmware for **ESP32-S3-N16R8** — Wi‑Fi promiscuous mode, CC1101 sub‑GHz, and E22/LR22 915 MHz LoRa on one board with a phone-friendly web dashboard.
+
+Join the board’s Wi‑Fi AP, open the dashboard, and see live devices with **real** signal data (RSSI, band, SSID, packet type). Distance is an **RSSI estimate** only — passive Wi‑Fi has no direction without extra hardware.
+
+## Features
+
+| Layer | What you get |
+|-------|----------------|
+| **Wi‑Fi** | Probes, beacons, data, deauth — MAC, RSSI, SSID, channel, zone |
+| **Sub‑GHz** | CC1101 scan on 315 / 433 / 868 / 915 MHz (bursts & carriers) |
+| **LoRa** | E22 UART 915 MHz transparent RX |
+| **Dashboard** | Signal range map, device cards with field notes, copy/JSON export, whitelist/blacklist |
+| **API** | JSON over HTTP — no device cap (PSRAM-backed hash table) |
+
+## Hardware
+
+**Board:** ESP32-S3-N16R8 (16 MB flash, 8 MB OPI PSRAM)
+
+| Module | Signal | GPIO |
+|--------|--------|------|
+| **CC1101** | MOSI / MISO / SCK / CS / GDO0 | 11 / 13 / 12 / 10 / 9 |
+| **LR22 / E22** | TX → ESP RX, RX ← ESP TX, M0, M1 | 18 / 17 / 8 / 7 |
+
+- **M0 + M1 → GND** for LoRa receive (transparent mode).
+- LoRa UART default: **9600 baud** (E22 factory). For 115200 add `-DROOT_LR22_BAUD=115200` to `platformio.ini`.
+- Pin overrides: edit `ci_echolocation/root_config.h` or add `-DROOT_CC1101_CS=…` etc. in `build_flags`.
+
+GPS is **off** by default (`ROOT_ENABLE_GPS=0`). Lat/lon in the API only appear when a GPS module is attached and has a fix.
+
+## Build & flash
+
+```bash
+cd root
+pio run -e esp32-s3-n16r8
+pio run -e esp32-s3-n16r8 -t upload
+```
+
+Monitor serial at **115200**:
+
+```bash
+pio device monitor -b 115200
+```
+
+Serial commands: `status` · `rf` · `hop auto` · `hop <1-13>` · `help`
+
+## Use
+
+1. Power the board.
+2. On your phone, join Wi‑Fi **`root`** / password **`root-radar`**.
+3. Open **http://192.168.4.1**
+
+### Dashboard
+
+- **Signal range map** — dot **radius** = estimated distance from RSSI. Position around each ring is layout only, **not** measured direction.
+- **Device list** — each card explains every field (MAC, RSSI, band, type, etc.) and what you can do with it.
+- **Copy / JSON** — per device or all visible; **Clear** resets the session list.
+- Badge **`live/session`** — devices heard in the last 60s vs total this session.
+
+### HTTP API
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /api/ping` | Liveness |
+| `GET /api/devices` | All tracked devices (JSON) |
+| `GET /api/sightings?mac=AA:BB:…` | RSSI/distance history for one MAC |
+| `GET /api/rf` | Sub‑GHz + LoRa driver status |
+| `GET /api/channel?ch=auto` or `?ch=6` | Wi‑Fi channel / hop mode |
+
+Example:
+
+```bash
+curl -s http://192.168.4.1/api/rf | jq .
+curl -s http://192.168.4.1/api/devices | jq '.count, .devices[0]'
+```
+
+### With DD / kitdd
+
+```bash
+export KIT_ROOT=http://192.168.4.1
+kitdd wifi
+kitdd subghz
+kitdd lora
+kitdd session
+```
+
+## What's real vs estimated
+
+| Data | Source |
+|------|--------|
+| MAC, SSID, channel, packet type | Measured from air |
+| RSSI | Measured at antenna |
+| Distance (`distance_m`) | **Estimated** from RSSI (walls/fade skew it) |
+| Direction / bearing | **Not provided** — no fake angles in API or radar |
+| GPS lat/lon | Only when GPS hardware enabled and fixed |
+
+## Project layout
+
+```
+ci_echolocation/
+  ci_echolocation.ino   Main firmware
+  ci_dashboard.h        Embedded web UI (PROGMEM)
+  rf_subghz.cpp           CC1101 (RadioLib)
+  rf_lora.cpp             E22 UART LoRa
+  root_config.h           Pins & thresholds
+  sight_log.cpp           Per-device RSSI history
+  psram_alloc.h           PSRAM STL allocator
+platformio.ini            Build env (default: esp32-s3-n16r8)
+scripts/ch343-attach.sh   WSL USB serial helper
+```
+
+## License
+
+Firmware in this repo — use and modify for your own kit. Passive monitoring only; comply with local RF and privacy laws.
