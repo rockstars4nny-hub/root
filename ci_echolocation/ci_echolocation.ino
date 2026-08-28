@@ -406,8 +406,17 @@ static void pruneStale() {
   if (!gDev || xSemaphoreTake(gMux, pdMS_TO_TICKS(20)) != pdTRUE) return;
   for (auto it = gDev->begin(); it != gDev->end();) {
     uint32_t staleMs = STALE_MS;
-    if (strcmp(it->second.band, "lora") == 0) staleMs = ROOT_LORA_STALE_MS;
-    else if (strcmp(it->second.band, "subghz") == 0) staleMs = 120000;
+    if (strcmp(it->second.band, "lora") == 0) {
+      staleMs = ROOT_LORA_STALE_MS;
+#if ROOT_ENABLE_LORA
+      static const uint8_t kLoraListener[] = {0x02, 0x4C, 0x91, 0x50, 0x00, 0x01};
+      if (loraReady() && memcmp(it->second.mac, kLoraListener, 6) == 0) {
+        live++;
+        ++it;
+        continue;
+      }
+#endif
+    } else if (strcmp(it->second.band, "subghz") == 0) staleMs = 120000;
     if (now - it->second.lastSeenMs > staleMs) {
       it = gDev->erase(it);
     } else {
@@ -677,7 +686,11 @@ static void startWeb() {
   DefaultHeaders::Instance().addHeader("Cache-Control", "no-store");
 
   gServer.on("/", HTTP_GET, [](AsyncWebServerRequest* req) {
-    req->send_P(200, "text/html", DASHBOARD_HTML);
+    AsyncWebServerResponse* r = req->beginResponse_P(200, "text/html", DASHBOARD_HTML);
+    r->addHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    r->addHeader("Pragma", "no-cache");
+    r->addHeader("Expires", "0");
+    req->send(r);
   });
 
   gServer.on("/hotspot-detect.html", HTTP_GET, answerCaptive);

@@ -168,17 +168,22 @@ bool loraPopHit(LoraHit* out) {
 }
 
 bool loraPopActivity(LoraHit* out) {
-  if (!out || !gOk || !gLastUartMs) return false;
-  const uint32_t now = millis();
-  if (now - gLastUartMs > ROOT_LORA_STALE_MS) return false;
+  if (!out || !gOk) return false;
 
   LoraHit h = {};
   memcpy(h.mac, kActivityMac, 6);
-  h.rssi = gLastRssi;
-  if (gLastLabel[0]) {
-    snprintf(h.label, sizeof h.label, "915 MHz · %s", gLastLabel);
+  const uint32_t now = millis();
+  const uint32_t idleMs = gLastUartMs ? (now - gLastUartMs) : 999999;
+  h.rssi = (idleMs < 5000) ? gLastRssi : -120;
+
+  if (gPktCount > 0 && gLastLabel[0]) {
+    snprintf(h.label, sizeof h.label, "LR22 · %lu pkts · %s",
+             (unsigned long)gPktCount, gLastLabel);
+  } else if (gUartBytes > 0) {
+    snprintf(h.label, sizeof h.label, "LR22 · %lu uart B · %lu pkts",
+             (unsigned long)gUartBytes, (unsigned long)gPktCount);
   } else {
-    strncpy(h.label, "915 MHz LoRa activity", sizeof h.label - 1);
+    strncpy(h.label, "LR22 · 915 MHz · listening", sizeof h.label - 1);
   }
   *out = h;
   return true;
