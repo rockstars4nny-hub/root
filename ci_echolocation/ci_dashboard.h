@@ -8,7 +8,7 @@ static const char DASHBOARD_HTML[] PROGMEM = R"HTML(
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
 <meta name="apple-mobile-web-app-capable" content="yes"/>
-<title>root · scanner</title>
+<title>root · Wi‑Fi · BLE · Sub‑GHz recon</title>
 <style>
 :root{
   --bg:#07080c;--bg2:#0c0e14;--panel:rgba(18,20,28,.92);--glass:rgba(255,255,255,.04);
@@ -44,7 +44,7 @@ body{
 }
 .brand-text{min-width:0}
 .brand-title{font-size:.95rem;font-weight:700;letter-spacing:-.02em;line-height:1.1}
-.brand-sub{font-size:.72rem;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.brand-tag{font-size:.68rem;color:var(--muted);letter-spacing:.02em}
 .status-dot{width:8px;height:8px;border-radius:50%;background:var(--accent);flex-shrink:0;box-shadow:0 0 12px var(--accent-dim)}
 .status-dot.off{background:var(--near);box-shadow:0 0 12px rgba(248,113,113,.4)}
 .status-count{
@@ -250,7 +250,8 @@ body{
   <div class="brand">
     <div class="brand-mark">RT</div>
     <div class="brand-text">
-      <div class="brand-title">root scanner</div>
+      <div class="brand-title">root</div>
+      <div class="brand-tag">Wi‑Fi · BLE · Sub‑GHz recon</div>
       <div class="brand-sub" id="statusMsg">Scanning…</div>
     </div>
   </div>

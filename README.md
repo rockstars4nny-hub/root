@@ -1,17 +1,29 @@
 # root
 
-Passive RF scanner firmware for **ESP32-S3-N16R8** — Wi‑Fi promiscuous mode, CC1101 sub‑GHz, and E22/LR22 915 MHz LoRa on one board with a phone-friendly web dashboard.
+**Wi‑Fi · BLE · Sub‑GHz recon** — passive field scanner for nearby wireless devices.
 
-Join the board’s Wi‑Fi AP, open the dashboard, and see live devices with **real** signal data (RSSI, band, SSID, packet type). Distance is an **RSSI estimate** only — passive Wi‑Fi has no direction without extra hardware.
+`root` is the ESP32 firmware + dashboard for **Wi‑Fi promiscuous** and **CC1101 sub‑GHz** (plus optional 915 MHz LoRa). **BLE** runs on your operator machine via **[kitdd](https://github.com/rockstars4nny-hub)** / DD — same session, merged exports.
+
+Power the board, join its AP, and collect MACs, RSSI, SSIDs, sub‑GHz bursts, and BLE advertisements in one recon workflow. Distance on the dashboard is an **RSSI estimate** only — no fake direction.
+
+## Recon stack
+
+| Band | Where | How |
+|------|--------|-----|
+| **Wi‑Fi** | ESP32 (this repo) | Promiscuous sniff — probes, beacons, data, deauth |
+| **Sub‑GHz** | ESP32 (this repo) | CC1101 — 315 / 433 / 868 / 915 MHz |
+| **BLE** | Host PC + `kitdd ble` | CSR / Windows BT adapter — active scan, GATT, export |
+| **LoRa** | ESP32 (optional) | E22 UART 915 MHz RX |
 
 ## Features
 
 | Layer | What you get |
 |-------|----------------|
 | **Wi‑Fi** | Probes, beacons, data, deauth — MAC, RSSI, SSID, channel, zone |
-| **Sub‑GHz** | CC1101 scan on 315 / 433 / 868 / 915 MHz (bursts & carriers) |
+| **Sub‑GHz** | CC1101 scan — remotes, sensors, fixed emitters, TPMS-class bursts |
+| **BLE** | Via `kitdd ble` — names, services, RSSI, parsed JSON to `~/dd-sessions` |
 | **LoRa** | E22 UART 915 MHz transparent RX |
-| **Dashboard** | Signal range map, device cards with field notes, copy/JSON export, whitelist/blacklist |
+| **Dashboard** | Signal range map, device cards with field notes, copy/JSON, whitelist/blacklist |
 | **API** | JSON over HTTP — no device cap (PSRAM-backed hash table) |
 
 ## Hardware
@@ -75,15 +87,20 @@ curl -s http://192.168.4.1/api/rf | jq .
 curl -s http://192.168.4.1/api/devices | jq '.count, .devices[0]'
 ```
 
-### With DD / kitdd
+### With DD / kitdd (BLE + merged session)
 
 ```bash
 export KIT_ROOT=http://192.168.4.1
-kitdd wifi
-kitdd subghz
-kitdd lora
-kitdd session
+
+kitdd wifi              # pull /api/devices from root
+kitdd subghz            # sub-GHz snapshot
+kitdd ble               # BLE scan on host adapter → ~/dd-sessions
+kitdd ble -60           # 60s active BLE scan
+kitdd radar             # wifi + ble combined
+kitdd session           # wifi + ble + subghz one-shot
 ```
+
+BLE does **not** run on the ESP32 — use a USB BT dongle (CSR) or Windows Bluetooth with `kitdd` on the same laptop/WSL session as root.
 
 ## What's real vs estimated
 
