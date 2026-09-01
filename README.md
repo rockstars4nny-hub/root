@@ -6,7 +6,21 @@
 
 Power the board, join its AP, and collect MACs, RSSI, SSIDs, sub‑GHz bursts, and BLE advertisements in one recon workflow. Distance on the dashboard is an **RSSI estimate** only — no fake direction.
 
-## Recon stack
+## Capabilities
+
+| Area | What it does |
+|------|----------------|
+| **Wi‑Fi** | Promiscuous 802.11 — probes, beacons, data, deauth; MAC, RSSI, SSID, channel, vendor OUI, BSSID, encryption, per-type packet counts |
+| **Sub‑GHz** | CC1101 scan — 315 / 433 / 868 / 915 MHz (remotes, sensors, TPMS-class bursts) |
+| **LoRa** | Optional E22 UART 915 MHz transparent RX |
+| **BLE** | Host-side via `kitdd ble` — active scan, GATT, JSON export to `~/dd-sessions` |
+| **Dashboard** | Signal range map (RSSI distance rings), device cards, field notes, whitelist/blacklist, copy/JSON |
+| **HTTP API** | `GET /api/devices`, `/api/rf`, `/api/sightings`, `/api/ping` — PSRAM-backed, no device cap |
+| **GPS inject** | Operator laptop pushes fix via `POST /api/gps` (ARIA / browser); onboard UART GPS optional |
+| **ARIA** | Device pull into Stem · Radar; join AP `root` / `root-radar` @ `192.168.4.1` |
+| **DD / kitdd** | `kitdd wifi`, `subghz`, `ble`, `radar`, `session` — merged field exports |
+
+**Honesty:** RSSI and packet fields are measured; distance is estimated; bearing/direction is **not** provided.
 
 | Band | Where | How |
 |------|--------|-----|
@@ -19,7 +33,7 @@ Power the board, join its AP, and collect MACs, RSSI, SSIDs, sub‑GHz bursts, a
 
 | Layer | What you get |
 |-------|----------------|
-| **Wi‑Fi** | Probes, beacons, data, deauth — MAC, RSSI, SSID, channel, zone |
+| **Wi‑Fi** | Probes, beacons, data, deauth — MAC, RSSI, SSID, channel, zone, vendor OUI, BSSID, encryption, per-type packet counts |
 | **Sub‑GHz** | CC1101 scan — remotes, sensors, fixed emitters, TPMS-class bursts |
 | **BLE** | Via `kitdd ble` — names, services, RSSI, parsed JSON to `~/dd-sessions` |
 | **LoRa** | E22 UART 915 MHz transparent RX |
@@ -39,7 +53,13 @@ Power the board, join its AP, and collect MACs, RSSI, SSIDs, sub‑GHz bursts, a
 - LoRa UART default: **9600 baud** (E22 factory). For 115200 add `-DROOT_LR22_BAUD=115200` to `platformio.ini`.
 - Pin overrides: edit `ci_echolocation/root_config.h` or add `-DROOT_CC1101_CS=…` etc. in `build_flags`.
 
-GPS is **off** by default (`ROOT_ENABLE_GPS=0`). Lat/lon in the API only appear when a GPS module is attached and has a fix.
+GPS is **off** by default on the ESP (`ROOT_ENABLE_GPS=0`). You can still geotag from the **operator laptop**:
+
+1. Browser Geolocation (ARIA) or **gpsd** on the laptop
+2. ARIA / browser pushes to Root: `POST http://192.168.4.1/api/gps` `{"lat":…,"lon":…}`
+3. Root serves that fix as `scanner_gps` on `/api/devices` for ~30s (refresh by watching GPS in ARIA Radar)
+
+Onboard UART GPS still wins when `ROOT_ENABLE_GPS=1` and a module has a fix.
 
 ## Build & flash
 
@@ -106,7 +126,8 @@ BLE does **not** run on the ESP32 — use a USB BT dongle (CSR) or Windows Bluet
 
 | Data | Source |
 |------|--------|
-| MAC, SSID, channel, packet type | Measured from air |
+| MAC, SSID, channel, packet type, vendor, BSSID, encryption | Measured from promiscuous 802.11 capture |
+| Packet counts / rate (`pkts`, `pkt_rate`) | Measured from captured frame types |
 | RSSI | Measured at antenna |
 | Distance (`distance_m`) | **Estimated** from RSSI (walls/fade skew it) |
 | Direction / bearing | **Not provided** — no fake angles in API or radar |
@@ -118,6 +139,7 @@ BLE does **not** run on the ESP32 — use a USB BT dongle (CSR) or Windows Bluet
 ci_echolocation/
   ci_echolocation.ino   Main firmware
   ci_dashboard.h        Embedded web UI (PROGMEM)
+  wifi_pkt.cpp          802.11 frame parser (addr, OUI, encryption IEs)
   rf_subghz.cpp           CC1101 (RadioLib)
   rf_lora.cpp             E22 UART LoRa
   root_config.h           Pins & thresholds
