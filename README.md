@@ -6,21 +6,37 @@
 
 Power the board, join its AP, and collect MACs, RSSI, SSIDs, sub‑GHz bursts, and BLE advertisements in one recon workflow. Distance on the dashboard is an **RSSI estimate** only — no fake direction.
 
-## Capabilities
+## What you can do with root
 
-| Area | What it does |
-|------|----------------|
-| **Wi‑Fi** | Promiscuous 802.11 — probes, beacons, data, deauth; MAC, RSSI, SSID, channel, vendor OUI, BSSID, encryption, per-type packet counts |
-| **Sub‑GHz** | CC1101 scan — 315 / 433 / 868 / 915 MHz (remotes, sensors, TPMS-class bursts) |
-| **LoRa** | Optional E22 UART 915 MHz transparent RX |
-| **BLE** | Host-side via `kitdd ble` — active scan, GATT, JSON export to `~/dd-sessions` |
-| **Dashboard** | Signal range map (RSSI distance rings), device cards, field notes, whitelist/blacklist, copy/JSON |
-| **HTTP API** | `GET /api/devices`, `/api/rf`, `/api/sightings`, `/api/ping` — PSRAM-backed, no device cap |
-| **GPS inject** | Operator laptop pushes fix via `POST /api/gps` (ARIA / browser); onboard UART GPS optional |
-| **ARIA** | Device pull into Stem · Radar; join AP `root` / `root-radar` @ `192.168.4.1` |
-| **DD / kitdd** | `kitdd wifi`, `subghz`, `ble`, `radar`, `session` — merged field exports |
+Carry an ESP32-S3, power it up, join its Wi‑Fi, and **see every wireless device talking near you** — without connecting to their networks.
 
-**Honesty:** RSSI and packet fields are measured; distance is estimated; bearing/direction is **not** provided.
+### Wi‑Fi — hear everything on the air
+
+- **Passive promiscuous sniff** — capture probes, beacons, data frames, and deauth bursts without joining target networks.
+- **Identify devices** — MAC, vendor (OUI), BSSID, SSID, channel, encryption type, and **how many packets** each device sent.
+- **Estimate distance** from RSSI (honest: it's a guess, not a laser rangefinder).
+- **No fake bearings** — the map shows proximity rings, not made-up direction arrows.
+
+### Sub‑GHz + LoRa — remotes, sensors, bursts
+
+- **CC1101 scan** across 315 / 433 / 868 / 915 MHz — garage remotes, TPMS-class bursts, fixed sensors.
+- **Optional LoRa RX** on 915 MHz via E22 module.
+
+### Field dashboard @ `192.168.4.1`
+
+- **Signal range map** — dots sized by estimated distance; live vs session device counts.
+- **Device cards** with field notes, whitelist/blacklist, copy-one or copy-all JSON.
+- **HTTP API** for automation — unlimited device table backed by PSRAM.
+
+### Works with your laptop stack
+
+- **`kitdd ble`** on your host PC scans BLE (GATT, names, services) and exports to `~/dd-sessions`.
+- **ARIA** pulls Root devices into Stem · Radar and can **inject your laptop GPS** onto the kit.
+- **`kitdd session`** merges Wi‑Fi + BLE + sub‑GHz into one export.
+
+Join **`root` / `root-radar`** → open **http://192.168.4.1**
+
+## Recon stack
 
 | Band | Where | How |
 |------|--------|-----|
