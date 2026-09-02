@@ -2,7 +2,7 @@
 
 **Wi‑Fi · BLE · Sub‑GHz recon** — passive field scanner for nearby wireless devices.
 
-`root` is the ESP32 firmware + dashboard for **Wi‑Fi promiscuous** (with Espressif **Wi‑Fi LR**), **onboard BLE**, and **CC1101 sub‑GHz** (plus optional 915 MHz LoRa). SoftAP stays phone-friendly (b/g/n) while LR is OR’d for ESP↔ESP reach via ESP-NOW.
+`root` is the **ESP32-S3** firmware + dashboard for **Wi‑Fi promiscuous** (with Espressif **Wi‑Fi LR**), **onboard BLE**, and **CC1101 sub‑GHz** (plus optional 915 MHz LoRa). SoftAP stays phone-friendly (b/g/n) while LR is OR’d for ESP↔ESP reach via ESP-NOW.
 
 Power the board, join its AP, and collect MACs, RSSI, SSIDs, BLE advertisers, and sub‑GHz bursts in one recon workflow. Distance on the dashboard is an **RSSI estimate** only — no fake direction.
 
@@ -58,11 +58,11 @@ Full command reference: **[OMNI.md](OMNI.md)** — Serial, HTTP `/api/omni`, ARI
 
 | Band | Where | How |
 |------|--------|-----|
-| **Wi‑Fi** | ESP32 (this repo) | Promiscuous sniff — probes, beacons, data, deauth |
-| **Wi‑Fi LR** | ESP32 (this repo) | `WIFI_PROTOCOL_LR` + ESP-NOW peer (`./omni lr`) |
-| **BLE** | ESP32 (this repo) | Onboard advertise scan → `band=ble` |
-| **Sub‑GHz** | ESP32 (this repo) | CC1101 — 315 / 433 / 868 / 915 MHz |
-| **LoRa** | ESP32 (optional) | E22 UART 915 MHz RX |
+| **Wi‑Fi** | ESP32-S3 (this repo) | Promiscuous sniff — probes, beacons, data, deauth |
+| **Wi‑Fi LR** | ESP32-S3 (this repo) | `WIFI_PROTOCOL_LR` + ESP-NOW peer (`./omni lr`) |
+| **BLE** | ESP32-S3 (this repo) | Onboard advertise scan → `band=ble` |
+| **Sub‑GHz** | ESP32-S3 (this repo) | CC1101 — 315 / 433 / 868 / 915 MHz |
+| **LoRa** | ESP32-S3 (optional) | E22 UART 915 MHz RX |
 
 ## Features
 
