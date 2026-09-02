@@ -3,11 +3,30 @@
 #include <HardwareSerial.h>
 #include <Arduino.h>
 #include <string.h>
+#include <math.h>
+
+static GpsFix gFix;
+static GpsFix gInjected;
+static bool gHaveInject = false;
+static uint32_t gInjectMs = 0;
+
+// Laptop / host may push a fix when the board has no GPS module.
+void gpsInject(double lat, double lon, float altM, float hdop) {
+  if (!isfinite(lat) || !isfinite(lon)) return;
+  if (lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0) return;
+  if (fabs(lat) < 0.0001 && fabs(lon) < 0.0001) return;  // reject null-island
+  gInjected.lat = lat;
+  gInjected.lon = lon;
+  gInjected.altM = altM;
+  gInjected.hdop = (hdop > 0.f) ? hdop : 1.5f;
+  gInjected.valid = true;
+  gHaveInject = true;
+  gInjectMs = millis();
+}
 
 #if ROOT_ENABLE_GPS
 
 static HardwareSerial gGps(1);
-static GpsFix gFix;
 static char gLine[96];
 static size_t gLen = 0;
 
@@ -57,7 +76,7 @@ static void feed(const char* line) {
 
 void gpsInit() {
   gGps.begin(ROOT_GPS_BAUD, SERIAL_8N1, ROOT_GPS_RX, ROOT_GPS_TX);
-  Serial.printf("root: GPS UART (RX=%d TX=%d @ %d)\n",
+  Serial.printf("root: GPS UART (RX=%d TX=%d @ %d) + laptop inject\n",
                 ROOT_GPS_RX, ROOT_GPS_TX, ROOT_GPS_BAUD);
 }
 
@@ -76,12 +95,24 @@ void gpsPoll() {
   }
 }
 
-GpsFix gpsGet() { return gFix; }
+GpsFix gpsGet() {
+  // Hardware fix wins when fresh; otherwise laptop inject (TTL 30s)
+  if (gFix.valid) return gFix;
+  if (gHaveInject && gInjected.valid && (millis() - gInjectMs) < 30000UL) return gInjected;
+  return GpsFix();
+}
 
 #else
 
-void gpsInit() {}
+void gpsInit() {
+  Serial.println("root: GPS UART off — laptop inject via POST /api/gps");
+}
+
 void gpsPoll() {}
-GpsFix gpsGet() { return GpsFix(); }
+
+GpsFix gpsGet() {
+  if (gHaveInject && gInjected.valid && (millis() - gInjectMs) < 30000UL) return gInjected;
+  return GpsFix();
+}
 
 #endif

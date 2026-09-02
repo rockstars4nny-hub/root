@@ -3,7 +3,9 @@
  *
  * Join Wi-Fi  SSID: root   password: root-radar
  * Dashboard: http://192.168.4.1
- * API:       /api/devices  /api/rf  /api/channel
+ * API:       /api/devices  /api/rf  /api/channel  /api/omni
+ * OmniScan:  ./omni … via Serial or POST /api/omni
+ * Radios:    Wi-Fi (promiscuous + SoftAP b/g/n+LR) · BLE · CC1101 · LoRa
  */
 
 #include <WiFi.h>
@@ -18,9 +20,13 @@
 #include "root_config.h"
 #include "rf_subghz.h"
 #include "rf_lora.h"
+#include "rf_ble.h"
+#include "wifi_lr.h"
 #include "root_gps.h"
 #include "sight_log.h"
 #include "geo.h"
+#include "wifi_pkt.h"
+#include "omni_cmd.h"
 
 #if __has_include("esp32-hal-rgb-led.h")
 #include "esp32-hal-rgb-led.h"
@@ -29,12 +35,11 @@
 #define CI_HAS_NEOPIXEL 0
 #endif
 
-static const char* AP_SSID = "root";
-static const char* AP_PASS = "root-radar";
-static const uint8_t AP_CHANNEL = 6;
+static const char* AP_SSID = ROOT_AP_SSID;
+static const char* AP_PASS = ROOT_AP_PASS;
+static const uint8_t AP_CHANNEL = ROOT_AP_CHANNEL;
 // Finch-style session: keep devices on the board for minutes, not 30s.
 static const uint32_t STALE_MS = 300000;
-static const uint32_t HOP_DWELL_MS = 280;
 static const int8_t PING_DELTA_DB = 5;
 static const float TX_POWER_DBM = -50.0f;
 static const float PATH_LOSS_N = 2.0f;
@@ -59,32 +64,52 @@ enum FrameKind : uint8_t {
   KIND_MGMT = 3,
   KIND_DEAUTH = 4,
   KIND_SUBGHZ = 5,
-  KIND_LORA = 6
+  KIND_LORA = 6,
+  KIND_BLE = 7
 };
 
 struct SniffHit {
   uint8_t mac[6];
+  uint8_t dst[6];
+  uint8_t bssid[6];
   int8_t rssi;
   uint8_t channel;
   uint8_t kind;
+  uint16_t seq;
+  uint16_t frameLen;
   char ssid[33];
   char band[12];
+  char vendor[24];
+  char encrypt[16];
 };
 
 struct Device {
   uint8_t mac[6];
+  uint8_t bssid[6];
   int8_t rssi;
   int8_t hist[3];
   uint8_t histCount;
   uint8_t histIdx;
   float avgRssi;
+  float pktRate;
   uint32_t lastSeenMs;
   uint32_t firstSeenMs;
   uint32_t seenCount;
+  uint32_t pktProbe;
+  uint32_t pktBeacon;
+  uint32_t pktData;
+  uint32_t pktDeauth;
+  uint32_t pktMgmt;
+  uint32_t pktTs[8];
+  uint8_t pktTsIdx;
+  uint8_t pktTsCount;
   uint8_t channel;
   uint8_t kind;
+  uint16_t lastSeq;
   char ssid[33];
   char band[12];
+  char vendor[24];
+  char encrypt[16];
   bool inUse;
 };
 
@@ -112,6 +137,31 @@ static DNSServer gDns;
 static char* gJson = nullptr;
 static size_t gJsonCap = 0;
 
+// —— OmniScan state ——
+static bool gOmniRunning = true;
+static bool gBleScanIntent = true;  // onboard BLE on by default
+static char gBleFilter[40] = "";
+static char gLrPeer[18] = "";
+static char gApSsidBuf[33] = ROOT_AP_SSID;
+static uint32_t gHandshakeCount = 0;
+static uint32_t gDeauthCount = 0;
+static uint32_t gLoraPktCount = 0;
+static struct {
+  uint8_t attacker[6];
+  uint8_t target[6];
+  int8_t rssi;
+  uint32_t ms;
+  bool valid;
+} gLastDeauth = {};
+static struct {
+  uint8_t mac[6];
+  uint8_t bssid[6];
+  char ssid[33];
+  int8_t rssi;
+  uint32_t ms;
+  bool valid;
+} gLastHandshake = {};
+
 static uint64_t macKey(const uint8_t* mac) {
   uint64_t k = 0;
   memcpy(&k, mac, 6);
@@ -131,6 +181,11 @@ static bool macIgnored(const uint8_t* mac) {
   return false;
 }
 
+static bool macZero(const uint8_t* mac) {
+  static const uint8_t z[6] = {0};
+  return macEq(mac, z);
+}
+
 static void macStr(const uint8_t* mac, char* out, size_t n) {
   snprintf(out, n, "%02X:%02X:%02X:%02X:%02X:%02X",
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
@@ -148,6 +203,7 @@ static const char* kindName(uint8_t k) {
     case KIND_DEAUTH: return "deauth";
     case KIND_SUBGHZ: return "subghz";
     case KIND_LORA: return "lora";
+    case KIND_BLE: return "ble";
     default: return "mgmt";
   }
 }
@@ -222,6 +278,44 @@ static void triggerPingLed() {
   gPingStartMs = millis();
 }
 
+static void pushRssi(Device& d, int8_t rssi) {
+  d.hist[d.histIdx] = rssi;
+  d.histIdx = (d.histIdx + 1) % 3;
+  if (d.histCount < 3) d.histCount++;
+  int sum = 0;
+  for (uint8_t i = 0; i < d.histCount; i++) sum += d.hist[i];
+  d.avgRssi = (float)sum / (float)d.histCount;
+  d.rssi = rssi;
+}
+
+static void pushPktTs(Device& d, uint32_t nowMs) {
+  d.pktTs[d.pktTsIdx] = nowMs;
+  d.pktTsIdx = (d.pktTsIdx + 1) % 8;
+  if (d.pktTsCount < 8) d.pktTsCount++;
+  if (d.pktTsCount < 2) {
+    d.pktRate = 0.0f;
+    return;
+  }
+  const uint8_t newest = (d.pktTsIdx + 7) % 8;
+  const uint8_t oldest = (d.pktTsIdx + (8 - d.pktTsCount)) % 8;
+  const uint32_t span = d.pktTs[newest] - d.pktTs[oldest];
+  if (span < 500) {
+    d.pktRate = (float)d.pktTsCount * 1000.0f / 500.0f;
+    return;
+  }
+  d.pktRate = (float)(d.pktTsCount - 1) * 1000.0f / (float)span;
+}
+
+static void bumpPktKind(Device& d, uint8_t kind) {
+  switch (kind) {
+    case KIND_PROBE: d.pktProbe++; break;
+    case KIND_BEACON: d.pktBeacon++; break;
+    case KIND_DATA: d.pktData++; break;
+    case KIND_DEAUTH: d.pktDeauth++; break;
+    default: d.pktMgmt++; break;
+  }
+}
+
 static void snifferCb(void* buf, wifi_promiscuous_pkt_type_t type) {
   if (type == WIFI_PKT_MISC || buf == nullptr || gQueue == nullptr) return;
 
@@ -234,14 +328,26 @@ static void snifferCb(void* buf, wifi_promiscuous_pkt_type_t type) {
   const uint8_t subtype = (p[0] & 0xF0) >> 4;
   if (ftype == 1) return;
 
+  WifiPktMeta meta{};
+  wifiParseFrame(p, len, ftype, subtype, &meta);
+
   SniffHit hit;
-  memcpy(hit.mac, p + 10, 6);
+  memcpy(hit.mac, meta.src, 6);
   if (macIgnored(hit.mac)) return;
 
+  memcpy(hit.dst, meta.dst, 6);
+  memcpy(hit.bssid, meta.bssid, 6);
   hit.rssi = pkt->rx_ctrl.rssi;
   hit.channel = pkt->rx_ctrl.channel;
+  hit.seq = meta.seq;
+  hit.frameLen = len;
   hit.ssid[0] = 0;
+  hit.vendor[0] = 0;
+  hit.encrypt[0] = 0;
   strncpy(hit.band, "wifi", sizeof hit.band - 1);
+  if (meta.vendor[0]) strncpy(hit.vendor, meta.vendor, sizeof hit.vendor - 1);
+  if (meta.encrypt[0]) strncpy(hit.encrypt, meta.encrypt, sizeof hit.encrypt - 1);
+
   if (ftype == 2) {
     hit.kind = KIND_DATA;
   } else if (ftype == 0 && subtype == 4) {
@@ -252,21 +358,33 @@ static void snifferCb(void* buf, wifi_promiscuous_pkt_type_t type) {
     extractSsid(p, len, subtype, hit.ssid, sizeof(hit.ssid));
   } else if (ftype == 0 && (subtype == 12 || subtype == 10)) {
     hit.kind = KIND_DEAUTH;
+    gDeauthCount++;
+    memcpy(gLastDeauth.attacker, meta.src, 6);
+    memcpy(gLastDeauth.target, meta.dst, 6);
+    gLastDeauth.rssi = hit.rssi;
+    gLastDeauth.ms = millis();
+    gLastDeauth.valid = true;
   } else {
     hit.kind = KIND_MGMT;
   }
 
-  xQueueSend(gQueue, &hit, 0);
-}
+  // Passive EAPoL (ethertype 0x888e) → handshake counter
+  if (ftype == 2 && len > 32) {
+    for (uint16_t i = 24; i + 1 < len && i < 48; i++) {
+      if (p[i] == 0x88 && p[i + 1] == 0x8e) {
+        gHandshakeCount++;
+        memcpy(gLastHandshake.mac, meta.src, 6);
+        memcpy(gLastHandshake.bssid, meta.bssid, 6);
+        gLastHandshake.ssid[0] = 0;
+        gLastHandshake.rssi = hit.rssi;
+        gLastHandshake.ms = millis();
+        gLastHandshake.valid = true;
+        break;
+      }
+    }
+  }
 
-static void pushRssi(Device& d, int8_t rssi) {
-  d.hist[d.histIdx] = rssi;
-  d.histIdx = (d.histIdx + 1) % 3;
-  if (d.histCount < 3) d.histCount++;
-  int sum = 0;
-  for (uint8_t i = 0; i < d.histCount; i++) sum += d.hist[i];
-  d.avgRssi = (float)sum / (float)d.histCount;
-  d.rssi = rssi;
+  xQueueSend(gQueue, &hit, 0);
 }
 
 static void ingestHit(const SniffHit& hit) {
@@ -278,6 +396,7 @@ static void ingestHit(const SniffHit& hit) {
   Device& d = isNew ? (*gDev)[key] : it->second;
   const int8_t prev = isNew ? hit.rssi : d.rssi;
   const bool bigMove = !isNew && abs((int)hit.rssi - (int)prev) >= PING_DELTA_DB;
+  const uint8_t prevKind = isNew ? 255 : d.kind;
 
   if (isNew) {
     memset(&d, 0, sizeof(Device));
@@ -290,10 +409,22 @@ static void ingestHit(const SniffHit& hit) {
   }
 
   pushRssi(d, hit.rssi);
+  pushPktTs(d, millis());
+  bumpPktKind(d, hit.kind);
   d.lastSeenMs = millis();
   d.channel = hit.channel;
   d.kind = hit.kind;
+  d.lastSeq = hit.seq;
   strncpy(d.band, hit.band, sizeof d.band - 1);
+  if (!macZero(hit.bssid)) memcpy(d.bssid, hit.bssid, 6);
+  if (hit.vendor[0]) {
+    strncpy(d.vendor, hit.vendor, sizeof d.vendor - 1);
+    d.vendor[sizeof d.vendor - 1] = 0;
+  }
+  if (hit.encrypt[0]) {
+    strncpy(d.encrypt, hit.encrypt, sizeof d.encrypt - 1);
+    d.encrypt[sizeof d.encrypt - 1] = 0;
+  }
   if (hit.ssid[0]) {
     strncpy(d.ssid, hit.ssid, sizeof(d.ssid) - 1);
     d.ssid[sizeof(d.ssid) - 1] = 0;
@@ -302,9 +433,15 @@ static void ingestHit(const SniffHit& hit) {
   const float dist = rssiToDistance(hit.rssi);
   sightPush(d.mac, d.lastSeenMs, hit.rssi, dist);
 
-  const bool shouldPing = isNew || bigMove || hit.kind == KIND_DEAUTH;
+  const bool kindChanged = !isNew && prevKind != hit.kind;
+  const bool burst = d.pktRate >= 8.0f;
+  const bool shouldPing = isNew || bigMove || hit.kind == KIND_DEAUTH || kindChanged || burst;
   char macbuf[18];
-  if (shouldPing) macStr(d.mac, macbuf, sizeof(macbuf));
+  char bssidbuf[18] = {0};
+  if (shouldPing) {
+    macStr(d.mac, macbuf, sizeof(macbuf));
+    if (!macZero(d.bssid)) macStr(d.bssid, bssidbuf, sizeof(bssidbuf));
+  }
 
   xSemaphoreGive(gMux);
 
@@ -315,41 +452,52 @@ static void ingestHit(const SniffHit& hit) {
       gLastPingLogMs = logNow;
       Sighting last;
       const bool hasS = sightLatest(d.mac, &last);
+      const char* vendor = hit.vendor[0] ? hit.vendor : nullptr;
+      const char* encrypt = hit.encrypt[0] ? hit.encrypt : nullptr;
+      const char* bssidPart = bssidbuf[0] ? bssidbuf : nullptr;
       if (hit.ssid[0]) {
         if (hasS && last.gpsValid) {
           Serial.printf(
-            "root ping: [%s] | kind: %s | band: %s | ssid: %s | ch: %u | RSSI: %d dBm | "
-            "Distance: ~%.1fm | @ %.6f,%.6f\n",
+            "root ping: [%s] | kind: %s | band: %s | ssid: %s | ch: %u | pkts: %lu | rate: %.1f/s"
+            "%s%s%s%s%s%s | RSSI: %d dBm | Distance: ~%.1fm | @ %.6f,%.6f\n",
             macbuf, kindName(hit.kind), hit.band, hit.ssid, (unsigned)hit.channel,
+            (unsigned long)d.seenCount, d.pktRate,
+            vendor ? " | vendor: " : "", vendor ? vendor : "",
+            bssidPart ? " | bssid: " : "", bssidPart ? bssidPart : "",
+            encrypt ? " | encrypt: " : "", encrypt ? encrypt : "",
             (int)hit.rssi, dist, last.lat, last.lon);
-        } else if (hasS) {
-          Serial.printf(
-            "root ping: [%s] | kind: %s | band: %s | ssid: %s | ch: %u | RSSI: %d dBm | "
-            "Distance: ~%.1fm (est)\n",
-            macbuf, kindName(hit.kind), hit.band, hit.ssid, (unsigned)hit.channel,
-            (int)hit.rssi, dist);
         } else {
           Serial.printf(
-            "root ping: [%s] | kind: %s | band: %s | ssid: %s | ch: %u | RSSI: %d dBm | Distance: ~%.1fm\n",
-            macbuf, kindName(hit.kind), hit.band, hit.ssid, (unsigned)hit.channel, (int)hit.rssi, dist);
+            "root ping: [%s] | kind: %s | band: %s | ssid: %s | ch: %u | pkts: %lu | rate: %.1f/s"
+            "%s%s%s%s%s%s | RSSI: %d dBm | Distance: ~%.1fm\n",
+            macbuf, kindName(hit.kind), hit.band, hit.ssid, (unsigned)hit.channel,
+            (unsigned long)d.seenCount, d.pktRate,
+            vendor ? " | vendor: " : "", vendor ? vendor : "",
+            bssidPart ? " | bssid: " : "", bssidPart ? bssidPart : "",
+            encrypt ? " | encrypt: " : "", encrypt ? encrypt : "",
+            (int)hit.rssi, dist);
         }
       } else {
         if (hasS && last.gpsValid) {
           Serial.printf(
-            "root ping: [%s] | kind: %s | band: %s | ch: %u | RSSI: %d dBm | "
-            "Distance: ~%.1fm | @ %.6f,%.6f\n",
+            "root ping: [%s] | kind: %s | band: %s | ch: %u | pkts: %lu | rate: %.1f/s"
+            "%s%s%s%s%s%s | RSSI: %d dBm | Distance: ~%.1fm | @ %.6f,%.6f\n",
             macbuf, kindName(hit.kind), hit.band, (unsigned)hit.channel,
+            (unsigned long)d.seenCount, d.pktRate,
+            vendor ? " | vendor: " : "", vendor ? vendor : "",
+            bssidPart ? " | bssid: " : "", bssidPart ? bssidPart : "",
+            encrypt ? " | encrypt: " : "", encrypt ? encrypt : "",
             (int)hit.rssi, dist, last.lat, last.lon);
-        } else if (hasS) {
-          Serial.printf(
-            "root ping: [%s] | kind: %s | band: %s | ch: %u | RSSI: %d dBm | "
-            "Distance: ~%.1fm (est)\n",
-            macbuf, kindName(hit.kind), hit.band, (unsigned)hit.channel,
-            (int)hit.rssi, dist);
         } else {
           Serial.printf(
-            "root ping: [%s] | kind: %s | band: %s | ch: %u | RSSI: %d dBm | Distance: ~%.1fm\n",
-            macbuf, kindName(hit.kind), hit.band, (unsigned)hit.channel, (int)hit.rssi, dist);
+            "root ping: [%s] | kind: %s | band: %s | ch: %u | pkts: %lu | rate: %.1f/s"
+            "%s%s%s%s%s%s | RSSI: %d dBm | Distance: ~%.1fm\n",
+            macbuf, kindName(hit.kind), hit.band, (unsigned)hit.channel,
+            (unsigned long)d.seenCount, d.pktRate,
+            vendor ? " | vendor: " : "", vendor ? vendor : "",
+            bssidPart ? " | bssid: " : "", bssidPart ? bssidPart : "",
+            encrypt ? " | encrypt: " : "", encrypt ? encrypt : "",
+            (int)hit.rssi, dist);
         }
       }
     }
@@ -358,7 +506,7 @@ static void ingestHit(const SniffHit& hit) {
 }
 
 static void ingestSubGhz(const SubGhzHit& sg) {
-  SniffHit hit;
+  SniffHit hit{};
   memcpy(hit.mac, sg.mac, 6);
   hit.rssi = sg.rssi;
   hit.channel = 0;
@@ -376,7 +524,8 @@ static void serviceSubGhz(uint32_t nowMs) {
 }
 
 static void ingestLora(const LoraHit& lh) {
-  SniffHit hit;
+  gLoraPktCount++;
+  SniffHit hit{};
   memcpy(hit.mac, lh.mac, 6);
   hit.rssi = lh.rssi;
   hit.channel = 0;
@@ -395,6 +544,29 @@ static void serviceLora(uint32_t nowMs) {
   LoraHit lh;
   while (loraPopHit(&lh)) ingestLora(lh);
   if (loraPopActivity(&lh)) ingestLora(lh);
+}
+
+static void ingestBle(const BleHit& bh) {
+  SniffHit hit{};
+  memcpy(hit.mac, bh.mac, 6);
+  hit.rssi = bh.rssi;
+  hit.channel = 0;
+  hit.kind = KIND_BLE;
+  strncpy(hit.band, "ble", sizeof hit.band - 1);
+  if (bh.name[0]) {
+    strncpy(hit.ssid, bh.name, sizeof hit.ssid - 1);
+  } else {
+    strncpy(hit.ssid, "BLE", sizeof hit.ssid - 1);
+  }
+  ingestHit(hit);
+}
+
+static void serviceBle(uint32_t nowMs) {
+  if (!gBleScanIntent) return;
+  bleService(nowMs);
+  BleHit bh;
+  int budget = 24;
+  while (budget-- > 0 && blePopHit(&bh)) ingestBle(bh);
 }
 
 static void pruneStale() {
@@ -416,7 +588,11 @@ static void pruneStale() {
         continue;
       }
 #endif
-    } else if (strcmp(it->second.band, "subghz") == 0) staleMs = 120000;
+    } else if (strcmp(it->second.band, "subghz") == 0) {
+      staleMs = 120000;
+    } else if (strcmp(it->second.band, "ble") == 0) {
+      staleMs = ROOT_BLE_STALE_MS;
+    }
     if (now - it->second.lastSeenMs > staleMs) {
       it = gDev->erase(it);
     } else {
@@ -491,7 +667,7 @@ static size_t buildJson() {
     n = (size_t)ROOT_API_MAX_DEVICES;
   }
 
-  ensureJson(1024 + n * 320);
+  ensureJson(1024 + n * 480);
   if (!gJson) {
     if (snap) free(snap);
     return 0;
@@ -499,47 +675,60 @@ static size_t buildJson() {
 
   size_t returned = 0;
   bool truncated = false;
-  char tmp[320];
+  char tmp[512];
   char esc[96];
+  char escVendor[48];
+  char escEncrypt[32];
   const GpsFix scanner = gpsGet();
 
   size_t off = (size_t)snprintf(
       gJson, gJsonCap,
       "{\"name\":\"root\",\"uptime_ms\":%lu,\"session_ms\":%lu,\"channel\":%u,\"hopping\":%s,"
-      "\"stations\":%u,\"subghz\":%s,\"lora\":%s,"
+      "\"stations\":%u,\"subghz\":%s,\"lora\":%s,\"ble\":%s,\"wifi_lr\":%s,"
       "\"scanner_gps\":{\"valid\":%s,\"lat\":%.7f,\"lon\":%.7f},\"devices\":[",
       (unsigned long)now, (unsigned long)(now - gSessionStartMs), (unsigned)gChannel,
       gHopEnable ? "true" : "false",
       (unsigned)WiFi.softAPgetStationNum(),
       subghzReady() ? "true" : "false", loraReady() ? "true" : "false",
+      (bleReady() && bleEnabled()) ? "true" : "false",
+      wifiLrProtocolOk() ? "true" : "false",
       scanner.valid ? "true" : "false", jsonNum(scanner.lat), jsonNum(scanner.lon));
 
   for (size_t i = 0; i < n; i++) {
-    if (off + 360 >= gJsonCap) {
+    if (off + 520 >= gJsonCap) {
       truncated = true;
       break;
     }
     char macbuf[18];
+    char bssidbuf[18] = {0};
     macStr(snap[i].d.mac, macbuf, sizeof(macbuf));
+    if (!macZero(snap[i].d.bssid)) macStr(snap[i].d.bssid, bssidbuf, sizeof(bssidbuf));
     const uint32_t age = now - snap[i].d.lastSeenMs;
     const uint32_t sinceFirst = now - snap[i].d.firstSeenMs;
     Sighting last;
     const bool hasLast = sightLatest(snap[i].d.mac, &last);
     jsonEscape(snap[i].d.ssid[0] ? snap[i].d.ssid : "", esc, sizeof esc);
+    jsonEscape(snap[i].d.vendor[0] ? snap[i].d.vendor : "", escVendor, sizeof escVendor);
+    jsonEscape(snap[i].d.encrypt[0] ? snap[i].d.encrypt : "", escEncrypt, sizeof escEncrypt);
     const int wrote = snprintf(
         tmp, sizeof(tmp),
         "%s{\"mac\":\"%s\",\"rssi\":%d,\"avg\":%.1f,\"distance_m\":%.2f,"
         "\"zone\":\"%s\",\"last_seen_ms\":%lu,\"first_seen_ms\":%lu,"
-        "\"seen_count\":%lu,\"ch\":%u,\"kind\":\"%s\","
-        "\"band\":\"%s\",\"ssid\":\"%s\",\"rand\":%s,"
+        "\"seen_count\":%lu,\"pkt_rate\":%.2f,"
+        "\"pkts\":{\"probe\":%lu,\"beacon\":%lu,\"data\":%lu,\"deauth\":%lu,\"mgmt\":%lu},"
+        "\"ch\":%u,\"kind\":\"%s\",\"band\":\"%s\",\"ssid\":\"%s\","
+        "\"vendor\":\"%s\",\"encrypt\":\"%s\",\"bssid\":\"%s\",\"rand\":%s,"
         "\"lat\":%.7f,\"lon\":%.7f,\"gps\":%s,\"sightings\":[]}",
         returned ? "," : "", macbuf, (int)snap[i].d.rssi, snap[i].d.avgRssi,
         rssiToDistance(snap[i].d.avgRssi), zoneName(snap[i].d.avgRssi),
         (unsigned long)age, (unsigned long)sinceFirst,
-        (unsigned long)snap[i].d.seenCount,
+        (unsigned long)snap[i].d.seenCount, snap[i].d.pktRate,
+        (unsigned long)snap[i].d.pktProbe, (unsigned long)snap[i].d.pktBeacon,
+        (unsigned long)snap[i].d.pktData, (unsigned long)snap[i].d.pktDeauth,
+        (unsigned long)snap[i].d.pktMgmt,
         (unsigned)snap[i].d.channel, kindName(snap[i].d.kind),
         snap[i].d.band[0] ? snap[i].d.band : "wifi",
-        esc,
+        esc, escVendor, escEncrypt, bssidbuf,
         macRandomized(snap[i].d.mac) ? "true" : "false",
         jsonNum(hasLast && last.gpsValid ? last.lat : 0.0),
         jsonNum(hasLast && last.gpsValid ? last.lon : 0.0),
@@ -566,11 +755,310 @@ static size_t buildJson() {
   return off;
 }
 
+static void lockApChannel();
+static void setChannelManual(uint8_t ch, bool hop);
+static bool bringUpSoftAp();
+
+static void lockApChannel() {
+  if (gChannel == AP_CHANNEL) return;
+  if (esp_wifi_set_channel(AP_CHANNEL, WIFI_SECOND_CHAN_NONE) == ESP_OK) {
+    gChannel = AP_CHANNEL;
+  }
+}
+
+// —— OmniScan hooks ——
+static OmniSnapshot omniSnap() {
+  OmniSnapshot s = {};
+  s.running = gOmniRunning;
+  s.uptimeMs = millis();
+  s.wifiChannel = gChannel;
+  s.wifiHopping = gHopEnable;
+  s.wifiDevices = gDev ? (uint32_t)gDev->size() : 0;
+  s.handshakes = gHandshakeCount;
+  s.deauths = gDeauthCount;
+  s.bleOn = gBleScanIntent && bleEnabled();
+  s.bleDevices = bleTrackedCount();
+  s.wifiLr = wifiLrProtocolOk();
+  s.subghzOn = subghzEnabled();
+  s.subghzHopping = subghzHopping();
+  s.subghzFreqMhz = subghzCurrentMhz();
+  s.subghzPackets = subghzPacketCount();
+  s.loraOn = loraReady();
+  s.loraFreqMhz = 915.0f;
+  s.loraPackets = gLoraPktCount;
+  GpsFix g = gpsGet();
+  s.gpsLocked = g.valid;
+  s.gpsLat = g.lat;
+  s.gpsLon = g.lon;
+  s.gpsAlt = g.altM;
+  s.gpsSpeedKmh = g.speedKmh;
+  s.gpsSats = 0;
+  s.gpsHdop = g.hdop;
+  s.apOn = true;
+  strncpy(s.apSsid, gApSsidBuf[0] ? gApSsidBuf : AP_SSID, sizeof s.apSsid - 1);
+  s.apChannel = AP_CHANNEL;
+  s.apClients = (uint8_t)WiFi.softAPgetStationNum();
+  macStr(gApMac, s.apMac, sizeof s.apMac);
+  macStr(gSelfMac, s.wifiMac, sizeof s.wifiMac);
+  bleGetMacStr(s.bleMac, sizeof s.bleMac);
+  snprintf(s.apIp, sizeof s.apIp, "%s", WiFi.softAPIP().toString().c_str());
+  s.lrReady = wifiLrReady();
+  s.lrRssi = wifiLrRssi();
+  s.lrSent = wifiLrSent();
+  s.lrAcked = wifiLrAcked();
+  wifiLrGetPeer(s.lrPeer, sizeof s.lrPeer);
+  if (!s.lrPeer[0] && gLrPeer[0]) strncpy(s.lrPeer, gLrPeer, sizeof s.lrPeer - 1);
+  s.sdMounted = false;
+  s.sdFreeGb = 0;
+  snprintf(s.logPath, sizeof s.logPath, "psram://session");
+  s.logEntries = s.wifiDevices;
+  s.logSizeMb = 0;
+  s.freeHeap = ESP.getFreeHeap();
+  s.freePsram = ESP.getFreePsram();
+  s.psramSize = ESP.getPsramSize();
+  s.cpuTempC = temperatureRead();
+  return s;
+}
+
+static bool omniSetRunning(bool on) {
+  gOmniRunning = on;
+  if (on) {
+    esp_wifi_set_promiscuous(true);
+    subghzSetEnabled(true);
+    gBleScanIntent = true;
+    bleSetEnabled(true);
+  } else {
+    bleSetEnabled(false);
+  }
+  return true;
+}
+static bool omniSetWifiCh(int ch) {
+  if (ch == 0) {
+    gHopEnable = true;
+    return true;
+  }
+  if (ch == -1) {
+    gHopEnable = false;
+    return true;
+  }
+  if (ch >= 1 && ch <= 11) {
+    setChannelManual((uint8_t)ch, false);
+    return true;
+  }
+  return false;
+}
+static bool omniSetBle(bool on) {
+  gBleScanIntent = on;
+  bleSetEnabled(on);
+  return true;
+}
+static bool omniSetSg(bool on) {
+  subghzSetEnabled(on);
+  return true;
+}
+static bool omniSetSgFreq(float mhz) {
+  return subghzSetFrequencyMhz(mhz);
+}
+static bool omniSetLora(bool on) {
+  (void)on;
+  return loraReady();
+}
+static bool omniSetLoraFreq(float mhz) {
+  (void)mhz;
+  return true;
+}
+static bool omniGpsReset() { return true; }
+static bool omniSetAp(bool on) {
+  (void)on;
+  return true;
+}
+static bool omniSetApSsid(const char* ssid) {
+  if (!ssid || !ssid[0]) return false;
+  strncpy(gApSsidBuf, ssid, sizeof gApSsidBuf - 1);
+  bringUpSoftAp();
+  return true;
+}
+static bool omniSetLrPeer(const char* mac) {
+  if (!mac) return false;
+  strncpy(gLrPeer, mac, sizeof gLrPeer - 1);
+  gLrPeer[sizeof gLrPeer - 1] = 0;
+  return wifiLrSetPeer(mac);
+}
+static bool omniLrSend(const char* msg) {
+  return wifiLrSend(msg);
+}
+static bool omniLrTest(char* out, size_t n) {
+  return wifiLrTest(out, n);
+}
+static bool omniLogSave(char* pathOut, size_t n) {
+  snprintf(pathOut, n, "psram://omniscan_%lu.json", (unsigned long)millis());
+  return true;
+}
+static bool omniLogDump(char* out, size_t n) {
+  snprintf(out, n,
+           "Dumping log...\n{\"exported_at_ms\":%lu,\"name\":\"root\",\"devices\":%u}\nDone.\n",
+           (unsigned long)millis(), gDev ? (unsigned)gDev->size() : 0u);
+  return true;
+}
+static bool omniSysReset() {
+  delay(200);
+  ESP.restart();
+  return true;
+}
+static bool omniWifiHs(char* out, size_t n) {
+  size_t u = 0;
+  auto ap = [&](const char* s) {
+    size_t l = strlen(s);
+    if (u + l + 1 < n) {
+      memcpy(out + u, s, l);
+      u += l;
+      out[u] = 0;
+    }
+  };
+  char line[160];
+  ap("=== HANDSHAKE STATS ===\n");
+  snprintf(line, sizeof line, "Total Captured: %lu\n", (unsigned long)gHandshakeCount);
+  ap(line);
+  if (gLastHandshake.valid) {
+    char m[18], b[18];
+    macStr(gLastHandshake.mac, m, sizeof m);
+    macStr(gLastHandshake.bssid, b, sizeof b);
+    snprintf(line, sizeof line, "Last Capture: %lu ms uptime\nMAC: %s\nBSSID: %s\n",
+             (unsigned long)gLastHandshake.ms, m, b);
+    ap(line);
+    snprintf(line, sizeof line, "SSID: %s\nRSSI: %d dBm\n",
+             gLastHandshake.ssid[0] ? gLastHandshake.ssid : "(unknown)",
+             (int)gLastHandshake.rssi);
+    ap(line);
+    GpsFix g = gpsGet();
+    if (g.valid) {
+      snprintf(line, sizeof line, "GPS: %.7f, %.7f\n", g.lat, g.lon);
+      ap(line);
+    }
+  } else {
+    ap("No EAPoL frames observed yet (passive listen)\n");
+  }
+  return true;
+}
+static bool omniWifiDe(char* out, size_t n) {
+  char line[192];
+  size_t u = 0;
+  auto ap = [&](const char* s) {
+    size_t l = strlen(s);
+    if (u + l + 1 < n) {
+      memcpy(out + u, s, l);
+      u += l;
+      out[u] = 0;
+    }
+  };
+  ap("=== DEAUTH ATTACKS ===\n");
+  snprintf(line, sizeof line, "Total Detected: %lu\n", (unsigned long)gDeauthCount);
+  ap(line);
+  if (gLastDeauth.valid) {
+    char a[18], t[18];
+    macStr(gLastDeauth.attacker, a, sizeof a);
+    macStr(gLastDeauth.target, t, sizeof t);
+    snprintf(line, sizeof line,
+             "Last Attack: %lu ms uptime\nAttacker: %s\nTarget: %s\nRSSI: %d dBm\n",
+             (unsigned long)gLastDeauth.ms, a, t, (int)gLastDeauth.rssi);
+    ap(line);
+    GpsFix g = gpsGet();
+    if (g.valid) {
+      snprintf(line, sizeof line, "GPS: %.7f, %.7f\n", g.lat, g.lon);
+      ap(line);
+    }
+  } else {
+    ap("No deauth/disassoc frames observed yet\n");
+  }
+  return true;
+}
+static bool omniBleList(char* out, size_t n) {
+  return bleListText(out, n, gBleFilter[0] ? gBleFilter : nullptr);
+}
+static bool omniBleFilter(const char* name, char* out, size_t n) {
+  if (!name) return false;
+  if (strcasecmp(name, "clear") == 0) {
+    gBleFilter[0] = 0;
+    snprintf(out, n, "BLE filter cleared\n");
+  } else {
+    strncpy(gBleFilter, name, sizeof gBleFilter - 1);
+    snprintf(out, n, "BLE filter set to: %s\nShowing only devices matching \"%s\"\n",
+             name, name);
+  }
+  return true;
+}
+static bool omniSgList(char* out, size_t n) { return subghzListRecent(out, n); }
+static bool omniSgRaw(const char* args, char* out, size_t n) {
+  return subghzRawCommand(args, out, n);
+}
+static bool omniLoraList(char* out, size_t n) {
+  snprintf(out, n,
+           "=== LORA PACKETS (last) ===\n"
+           "Ready: %s · UART bytes: %lu · hits: %lu\n"
+           "Listening transparent RX on E22 (default 915 MHz)\n",
+           loraReady() ? "yes" : "no",
+           (unsigned long)loraUartBytes(), (unsigned long)gLoraPktCount);
+  return true;
+}
+
+static void omniSetupHooks() {
+  static OmniHooks hooks = {
+      omniSnap,        omniSetRunning, omniSetWifiCh,   omniSetBle,
+      omniSetSg,       omniSetSgFreq,  omniSetLora,     omniSetLoraFreq,
+      omniGpsReset,    omniSetAp,      omniSetApSsid,   omniSetLrPeer,
+      omniLrSend,      omniLrTest,     omniLogSave,     omniLogDump,
+      omniSysReset,    omniWifiHs,     omniWifiDe,      omniBleList,
+      omniBleFilter,   omniSgList,     omniSgRaw,       omniLoraList,
+  };
+  omniInit(&hooks);
+}
+
+static char gOmniOut[6144];
+
+static void omniRespondHttp(AsyncWebServerRequest* req, const char* cmd) {
+  const bool ok = omniHandle(cmd, gOmniOut, sizeof gOmniOut);
+  // JSON-escape output roughly
+  size_t need = strlen(gOmniOut) * 2 + 128;
+  char* body = (char*)malloc(need);
+  if (!body) {
+    req->send(500, "application/json", "{\"ok\":false,\"error\":\"oom\"}");
+    return;
+  }
+  size_t o = 0;
+  o += (size_t)snprintf(body + o, need - o, "{\"ok\":%s,\"status\":\"%s\",\"output\":\"",
+                        ok ? "true" : "false", ok ? "OK" : "ERROR");
+  for (const char* p = gOmniOut; *p && o + 8 < need; p++) {
+    char c = *p;
+    if (c == '"' || c == '\\') {
+      body[o++] = '\\';
+      body[o++] = c;
+    } else if (c == '\n') {
+      body[o++] = '\\';
+      body[o++] = 'n';
+    } else if (c == '\r') {
+      continue;
+    } else if ((uint8_t)c < 32) {
+      continue;
+    } else {
+      body[o++] = c;
+    }
+  }
+  o += (size_t)snprintf(body + o, need - o, "\"}");
+  req->send(200, "application/json", body);
+  free(body);
+}
+
+
 static void serviceHop() {
   if (!gHopEnable) return;
-  if (WiFi.softAPgetStationNum() > 0) return;
+  // Never move the SoftAP while a phone/laptop is joined — hopping kills the link.
+  if (WiFi.softAPgetStationNum() > 0) {
+    lockApChannel();
+    return;
+  }
   const uint32_t now = millis();
-  const uint32_t dwell = (gChannel == AP_CHANNEL) ? 1200 : HOP_DWELL_MS;
+  const uint32_t dwell =
+      (gChannel == AP_CHANNEL) ? ROOT_HOP_HOME_DWELL_MS : ROOT_HOP_AWAY_DWELL_MS;
   if (now - gLastHopMs < dwell) return;
   gLastHopMs = now;
 
@@ -615,23 +1103,33 @@ static void serviceLed() {
 
 static bool captivePath(const String& path) {
   return path.indexOf("generate_204") >= 0 || path.indexOf("gen_204") >= 0 ||
+         path.indexOf("connectivitycheck") >= 0 || path.indexOf("clients3.google.com") >= 0 ||
          path.endsWith("/hotspot-detect.html") || path.indexOf("connecttest") >= 0 ||
-         path.endsWith("/ncsi.txt") || path.indexOf("mobile/status") >= 0 ||
-         path.endsWith("/canonical.html") || path.endsWith("/success.txt");
+         path.endsWith("/ncsi.txt") || path.indexOf("msftncsi") >= 0 ||
+         path.indexOf("msftconnecttest") >= 0 || path.indexOf("mobile/status") >= 0 ||
+         path.endsWith("/canonical.html") || path.endsWith("/success.txt") ||
+         path.indexOf("captive.apple.com") >= 0 || path.indexOf("library/test") >= 0;
 }
 
 static void answerCaptive(AsyncWebServerRequest* req) {
   const String path = req->url();
-  if (path.indexOf("generate_204") >= 0 || path.indexOf("gen_204") >= 0) {
-    req->send(204);
+  // Never return 204 here — phones/Edge treat that as “full internet” then HTTPS fails.
+  if (path.indexOf("generate_204") >= 0 || path.indexOf("gen_204") >= 0 ||
+      path.indexOf("connectivitycheck") >= 0) {
+    req->redirect("http://192.168.4.1/");
     return;
   }
-  if (path.endsWith("/hotspot-detect.html")) {
+  if (path.endsWith("/hotspot-detect.html") || path.indexOf("captive.apple.com") >= 0 ||
+      path.indexOf("library/test") >= 0) {
     req->send(200, "text/html",
               "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>");
     return;
   }
-  if (path.indexOf("connecttest") >= 0 || path.endsWith("/ncsi.txt")) {
+  if (path.endsWith("/ncsi.txt") || path.indexOf("msftncsi") >= 0) {
+    req->send(200, "text/plain", "Microsoft NCSI");
+    return;
+  }
+  if (path.indexOf("connecttest") >= 0 || path.indexOf("msftconnecttest") >= 0) {
     req->send(200, "text/plain", "Microsoft Connect Test");
     return;
   }
@@ -642,26 +1140,59 @@ static void answerCaptive(AsyncWebServerRequest* req) {
   req->redirect("http://192.168.4.1/");
 }
 
-static void startRadio() {
+static void configureApRadio() {
   WiFi.mode(WIFI_AP);
   WiFi.setSleep(false);
   esp_wifi_set_ps(WIFI_PS_NONE);
-  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+  esp_wifi_set_inactive_time(WIFI_IF_AP, 0);
 
-  bool ok;
-  if (AP_PASS && strlen(AP_PASS) >= 8) {
-    ok = WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, 0, 8);
-  } else {
-    ok = WiFi.softAP(AP_SSID, nullptr, AP_CHANNEL, 0, 8);
+  wifi_country_t country = {};
+  strncpy(country.cc, "US", sizeof(country.cc));
+  country.schan = 1;
+  country.nchan = 11;
+  country.policy = WIFI_COUNTRY_POLICY_AUTO;
+  esp_wifi_set_country(&country);
+
+  esp_wifi_set_max_tx_power(ROOT_WIFI_TX_QUARTER_DBM);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  // b/g/n for phones; LR OR'd in wifiLrInit() after SoftAP is up
+  esp_wifi_set_protocol(WIFI_IF_AP,
+                        WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+  esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
+}
+
+static bool bringUpSoftAp() {
+  WiFi.softAPdisconnect(true);
+  delay(80);
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1),
+                    IPAddress(255, 255, 255, 0));
+
+  bool ok = false;
+  for (uint8_t attempt = 0; attempt < 3 && !ok; attempt++) {
+    const char* ssid = gApSsidBuf[0] ? gApSsidBuf : AP_SSID;
+    if (AP_PASS && strlen(AP_PASS) >= 8) {
+      ok = WiFi.softAP(ssid, AP_PASS, AP_CHANNEL, 0, 8);
+    } else {
+      ok = WiFi.softAP(ssid, nullptr, AP_CHANNEL, 0, 8);
+    }
+    if (!ok) delay(250);
   }
+  delay(200);
+  return ok && WiFi.softAPIP() != IPAddress(0, 0, 0, 0);
+}
 
-  delay(150);
+static void startRadio() {
+  configureApRadio();
+  const bool ok = bringUpSoftAp();
   gChannel = AP_CHANNEL;
+  gHopEnable = false;
 
   WiFi.macAddress(gSelfMac);
   WiFi.softAPmacAddress(gApMac);
 
   gDns.start(53, "*", WiFi.softAPIP());
+
+  esp_wifi_set_channel(AP_CHANNEL, WIFI_SECOND_CHAN_NONE);
 
   wifi_promiscuous_filter_t filter = {};
   filter.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA;
@@ -670,15 +1201,23 @@ static void startRadio() {
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_channel(AP_CHANNEL, WIFI_SECOND_CHAN_NONE);
 
+  int8_t txQuarterDbm = 0;
+  esp_wifi_get_max_tx_power(&txQuarterDbm);
+
   Serial.println(ok ? "root: SoftAP up" : "root: SoftAP failed");
-  Serial.printf("root: join '%s'  then open http://%s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
+  Serial.printf("root: join '%s' (ch %u, tx %.1f dBm) → http://%s\n",
+                AP_SSID, (unsigned)AP_CHANNEL, txQuarterDbm * 0.25f,
+                WiFi.softAPIP().toString().c_str());
   Serial.println("root: no internet on this AP is normal — phone stays connected via captive DNS");
+  Serial.println("root: hop auto moves RX only when no clients — AP stays on ch 6 most of the time");
 
   char m1[18], m2[18];
   macStr(gSelfMac, m1, sizeof(m1));
   macStr(gApMac, m2, sizeof(m2));
   Serial.printf("root: self MAC %s  AP MAC %s\n", m1, m2);
   Serial.println("root: promiscuous listen armed — unlimited device table (PSRAM)");
+
+  wifiLrInit();
 }
 
 static void startWeb() {
@@ -767,6 +1306,69 @@ static void startWeb() {
     req->send(200, "application/json", buf);
   });
 
+  // Laptop GPS inject — browser geolocation or gpsd on the operator machine
+  gServer.on("/api/gps", HTTP_POST, [](AsyncWebServerRequest* req) {},
+             NULL,
+             [](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
+               if (!data || len == 0 || len > 512) {
+                 req->send(400, "application/json", "{\"error\":\"body\"}");
+                 return;
+               }
+               char body[513];
+               size_t n = len < 512 ? len : 512;
+               memcpy(body, data, n);
+               body[n] = 0;
+               double lat = 0, lon = 0;
+               float alt = 0, hdop = 1.5f;
+               // minimal parse: "lat":N "lon"/"lng":N
+               const char* plat = strstr(body, "\"lat\"");
+               const char* plon = strstr(body, "\"lon\"");
+               if (!plon) plon = strstr(body, "\"lng\"");
+               if (!plat || !plon) {
+                 req->send(400, "application/json", "{\"error\":\"lat/lon required\"}");
+                 return;
+               }
+               plat = strchr(plat, ':');
+               plon = strchr(plon, ':');
+               if (!plat || !plon) {
+                 req->send(400, "application/json", "{\"error\":\"parse\"}");
+                 return;
+               }
+               lat = atof(plat + 1);
+               lon = atof(plon + 1);
+               const char* palt = strstr(body, "\"alt\"");
+               if (palt) {
+                 palt = strchr(palt, ':');
+                 if (palt) alt = (float)atof(palt + 1);
+               }
+               const char* ph = strstr(body, "\"hdop\"");
+               if (!ph) ph = strstr(body, "\"accuracy\"");
+               if (ph) {
+                 ph = strchr(ph, ':');
+                 if (ph) {
+                   float a = (float)atof(ph + 1);
+                   // browser accuracy is meters — map roughly to hdop
+                   hdop = a > 0 ? (a / 5.0f) : 1.5f;
+                 }
+               }
+               gpsInject(lat, lon, alt, hdop);
+               const GpsFix f = gpsGet();
+               char out[160];
+               snprintf(out, sizeof out,
+                        "{\"ok\":%s,\"lat\":%.7f,\"lon\":%.7f,\"source\":\"laptop\"}",
+                        f.valid ? "true" : "false", f.lat, f.lon);
+               req->send(200, "application/json", out);
+             });
+
+  gServer.on("/api/gps", HTTP_GET, [](AsyncWebServerRequest* req) {
+    const GpsFix f = gpsGet();
+    char out[192];
+    snprintf(out, sizeof out,
+             "{\"valid\":%s,\"lat\":%.7f,\"lon\":%.7f,\"alt\":%.1f,\"hdop\":%.2f}",
+             f.valid ? "true" : "false", f.lat, f.lon, f.altM, f.hdop);
+    req->send(200, "application/json", out);
+  });
+
   gServer.on("/api/channel", HTTP_GET, [](AsyncWebServerRequest* req) {
     if (req->hasParam("ch")) {
       const String v = req->getParam("ch")->value();
@@ -782,6 +1384,49 @@ static void startWeb() {
              (unsigned)gChannel, gHopEnable ? "true" : "false");
     req->send(200, "application/json", buf);
   });
+
+  gServer.on("/api/omni", HTTP_GET, [](AsyncWebServerRequest* req) {
+    String held = "./omni status";
+    if (req->hasParam("cmd")) held = req->getParam("cmd")->value();
+    omniRespondHttp(req, held.c_str());
+  });
+  gServer.on(
+      "/api/omni", HTTP_POST, [](AsyncWebServerRequest* req) {}, NULL,
+      [](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t) {
+        char cmd[256];
+        if ((!data || len == 0) && req->hasParam("cmd", true)) {
+          omniRespondHttp(req, req->getParam("cmd", true)->value().c_str());
+          return;
+        }
+        if (!data || len == 0 || len >= sizeof cmd) {
+          req->send(400, "application/json", "{\"ok\":false,\"error\":\"cmd required\"}");
+          return;
+        }
+        size_t n = len < sizeof(cmd) - 1 ? len : sizeof(cmd) - 1;
+        memcpy(cmd, data, n);
+        cmd[n] = 0;
+        const char* use = cmd;
+        char extracted[200];
+        const char* p = strstr(cmd, "\"cmd\"");
+        if (p) {
+          p = strchr(p + 5, '"');
+          if (p) {
+            p++;
+            size_t i = 0;
+            while (*p && *p != '"' && i + 1 < sizeof extracted) {
+              if (*p == '\\' && p[1]) {
+                p++;
+                extracted[i++] = *p++;
+              } else {
+                extracted[i++] = *p++;
+              }
+            }
+            extracted[i] = 0;
+            use = extracted;
+          }
+        }
+        omniRespondHttp(req, use);
+      });
 
   gServer.onNotFound([](AsyncWebServerRequest* req) {
     if (req->method() == HTTP_GET) {
@@ -803,8 +1448,11 @@ void setup() {
   delay(400);
   Serial.println();
   Serial.println("========================================");
-  Serial.println("  root  — Wi-Fi + CC1101 + LR22");
+  Serial.println("  root  — Wi-Fi LR + BLE + CC1101 + LR22");
   Serial.println("========================================");
+  strncpy(gApSsidBuf, ROOT_AP_SSID, sizeof gApSsidBuf - 1);
+  omniSetupHooks();
+  Serial.println("root: OmniScan ./omni commands ready (Serial + /api/omni)");
 
   sightInit();
   gDev = new DevMap();
@@ -819,20 +1467,22 @@ void setup() {
 
   ledWrite(0, 12, 4);
   startRadio();
+#if ROOT_ENABLE_BLE
+  bleInit();
+  bleSetEnabled(gBleScanIntent);
+#endif
 #if ROOT_ENABLE_SUBGHZ
   subghzInit();
 #endif
 #if ROOT_ENABLE_LORA
   loraInit();
 #endif
-#if ROOT_ENABLE_GPS
-  gpsInit();
-#endif
+  gpsInit();  // UART when ROOT_ENABLE_GPS; always accepts laptop inject via /api/gps
   startWeb();
 }
 
 static void serviceSerialCmds() {
-  static char line[48];
+  static char line[160];
   static size_t n = 0;
   while (Serial.available() > 0) {
     char c = (char)Serial.read();
@@ -841,12 +1491,22 @@ static void serviceSerialCmds() {
       line[n] = 0;
       n = 0;
       if (line[0] == 0) continue;
+      // OmniScan ./omni … (and aliases handled inside omniHandle)
+      if (strncmp(line, "./omni", 6) == 0 || strncmp(line, "omni", 4) == 0 ||
+          strcmp(line, "s") == 0 || strcmp(line, "h") == 0 || strcmp(line, "d") == 0 ||
+          strncmp(line, "ch ", 3) == 0 || strcmp(line, "start") == 0 ||
+          strcmp(line, "stop") == 0) {
+        omniHandle(line, gOmniOut, sizeof gOmniOut);
+        Serial.print(gOmniOut);
+        continue;
+      }
       if (strcmp(line, "status") == 0) {
-        Serial.printf("root: ch=%u hopping=%s devices=%u subghz=%s lora=%s\n",
+        Serial.printf("root: ch=%u hopping=%s devices=%u subghz=%s lora=%s omni=%s\n",
                       (unsigned)gChannel, gHopEnable ? "true" : "false",
                       gDev ? (unsigned)gDev->size() : 0u,
                       subghzReady() ? "up" : "down",
-                      loraReady() ? "up" : "down");
+                      loraReady() ? "up" : "down",
+                      gOmniRunning ? "run" : "stop");
       } else if (strncmp(line, "hop ", 4) == 0) {
         const char* arg = line + 4;
         if (strcmp(arg, "auto") == 0) {
@@ -867,7 +1527,17 @@ static void serviceSerialCmds() {
         loraStatusJson(lo, sizeof lo);
         Serial.printf("root rf: {\"subghz\":%s,\"lora\":%s}\n", sg, lo);
       } else if (strcmp(line, "help") == 0) {
-        Serial.println("root cmds: status | rf | hop auto | hop <1-13>");
+        Serial.println("root cmds: status | rf | hop auto | hop <1-13> | ./omni …");
+        omniHandle("./omni system help", gOmniOut, sizeof gOmniOut);
+        Serial.print(gOmniOut);
+      } else {
+        // Try as omni shorthand
+        omniHandle(line, gOmniOut, sizeof gOmniOut);
+        if (strstr(gOmniOut, "Unknown command")) {
+          Serial.println("root: unknown — try help or ./omni system help");
+        } else {
+          Serial.print(gOmniOut);
+        }
       }
       continue;
     }
@@ -877,11 +1547,9 @@ static void serviceSerialCmds() {
 }
 
 void loop() {
-  for (int i = 0; i < 4; i++) gDns.processNextRequest();
+  for (int i = 0; i < 32; i++) gDns.processNextRequest();
   const uint32_t now = millis();
-#if ROOT_ENABLE_GPS
-  gpsPoll();
-#endif
+  gpsPoll();  // UART when ROOT_ENABLE_GPS; inject TTL handled in gpsGet()
   SniffHit hit;
   int budget = 20;
   while (budget-- > 0 && xQueueReceive(gQueue, &hit, 0) == pdTRUE) {
@@ -894,6 +1562,10 @@ void loop() {
 
 #if ROOT_ENABLE_LORA
   serviceLora(now);
+#endif
+
+#if ROOT_ENABLE_BLE
+  serviceBle(now);
 #endif
 
   serviceSerialCmds();

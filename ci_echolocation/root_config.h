@@ -68,6 +68,11 @@
 #ifndef ROOT_ENABLE_GPS
 #define ROOT_ENABLE_GPS 0
 #endif
+
+// Onboard ESP32-S3 BLE advertise scan (coexists with SoftAP; short duty cycle)
+#ifndef ROOT_ENABLE_BLE
+#define ROOT_ENABLE_BLE 1
+#endif
 #ifndef ROOT_GPS_RX
 #define ROOT_GPS_RX 4
 #endif
@@ -76,6 +81,28 @@
 #endif
 #ifndef ROOT_GPS_BAUD
 #define ROOT_GPS_BAUD 9600
+#endif
+
+// SoftAP / Wi-Fi radio (2.4 GHz)
+#ifndef ROOT_AP_SSID
+#define ROOT_AP_SSID "root"
+#endif
+#ifndef ROOT_AP_PASS
+#define ROOT_AP_PASS "root-radar"
+#endif
+#ifndef ROOT_AP_CHANNEL
+#define ROOT_AP_CHANNEL 6
+#endif
+// esp_wifi_set_max_tx_power units: 0.25 dBm (78 ≈ 19.5 dBm, legal US max)
+#ifndef ROOT_WIFI_TX_QUARTER_DBM
+#define ROOT_WIFI_TX_QUARTER_DBM 78
+#endif
+// When channel hopping: stay on AP channel long enough for phones to see/join SoftAP.
+#ifndef ROOT_HOP_HOME_DWELL_MS
+#define ROOT_HOP_HOME_DWELL_MS 4500
+#endif
+#ifndef ROOT_HOP_AWAY_DWELL_MS
+#define ROOT_HOP_AWAY_DWELL_MS 120
 #endif
 
 // 0 = no API cap (return every tracked device)

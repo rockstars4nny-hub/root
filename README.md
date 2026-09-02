@@ -2,9 +2,9 @@
 
 **Wi‑Fi · BLE · Sub‑GHz recon** — passive field scanner for nearby wireless devices.
 
-`root` is the ESP32 firmware + dashboard for **Wi‑Fi promiscuous** and **CC1101 sub‑GHz** (plus optional 915 MHz LoRa). **BLE** runs on your operator machine via **[kitdd](https://github.com/rockstars4nny-hub)** / DD — same session, merged exports.
+`root` is the ESP32 firmware + dashboard for **Wi‑Fi promiscuous** (with Espressif **Wi‑Fi LR**), **onboard BLE**, and **CC1101 sub‑GHz** (plus optional 915 MHz LoRa). SoftAP stays phone-friendly (b/g/n) while LR is OR’d for ESP↔ESP reach via ESP-NOW.
 
-Power the board, join its AP, and collect MACs, RSSI, SSIDs, sub‑GHz bursts, and BLE advertisements in one recon workflow. Distance on the dashboard is an **RSSI estimate** only — no fake direction.
+Power the board, join its AP, and collect MACs, RSSI, SSIDs, BLE advertisers, and sub‑GHz bursts in one recon workflow. Distance on the dashboard is an **RSSI estimate** only — no fake direction.
 
 ## What you can do with root
 
@@ -13,9 +13,15 @@ Carry an ESP32-S3, power it up, join its Wi‑Fi, and **see every wireless devic
 ### Wi‑Fi — hear everything on the air
 
 - **Passive promiscuous sniff** — capture probes, beacons, data frames, and deauth bursts without joining target networks.
+- **Espressif Wi‑Fi LR** — SoftAP runs `b/g/n + LR` so phones still join while ESP↔ESP long-range / ESP-NOW (`./omni lr`) works.
 - **Identify devices** — MAC, vendor (OUI), BSSID, SSID, channel, encryption type, and **how many packets** each device sent.
 - **Estimate distance** from RSSI (honest: it's a guess, not a laser rangefinder).
 - **No fake bearings** — the map shows proximity rings, not made-up direction arrows.
+
+### BLE — onboard ESP32-S3
+
+- **Active advertise scan** on the kit radio (`./omni ble scan on|off`, `list`, `filter`).
+- Devices show up in `/api/devices` with `"band":"ble"` and on the dashboard BLE pill/filter.
 
 ### Sub‑GHz + LoRa — remotes, sensors, bursts
 
@@ -30,19 +36,32 @@ Carry an ESP32-S3, power it up, join its Wi‑Fi, and **see every wireless devic
 
 ### Works with your laptop stack
 
-- **`kitdd ble`** on your host PC scans BLE (GATT, names, services) and exports to `~/dd-sessions`.
-- **ARIA** pulls Root devices into Stem · Radar and can **inject your laptop GPS** onto the kit.
-- **`kitdd session`** merges Wi‑Fi + BLE + sub‑GHz into one export.
+- **ARIA** Omni tab drives `./omni` over `POST /api/root/omni` and pulls Root devices into Stem · Radar.
+- **Laptop GPS inject** still works via `POST /api/gps`.
+- Optional **`kitdd`** can still merge host-side extras if you want deeper GATT on a USB BT dongle.
 
 Join **`root` / `root-radar`** → open **http://192.168.4.1**
+
+## OmniScan (`./omni`)
+
+Full command reference: **[OMNI.md](OMNI.md)** — Serial, HTTP `/api/omni`, ARIA Omni tab, BLE, Sub‑GHz raw, Wi‑Fi LR / ESP-NOW.
+
+```text
+./omni start
+./omni status
+./omni ble list
+./omni subghz raw
+./omni system help
+```
 
 ## Recon stack
 
 | Band | Where | How |
 |------|--------|-----|
 | **Wi‑Fi** | ESP32 (this repo) | Promiscuous sniff — probes, beacons, data, deauth |
+| **Wi‑Fi LR** | ESP32 (this repo) | `WIFI_PROTOCOL_LR` + ESP-NOW peer (`./omni lr`) |
+| **BLE** | ESP32 (this repo) | Onboard advertise scan → `band=ble` |
 | **Sub‑GHz** | ESP32 (this repo) | CC1101 — 315 / 433 / 868 / 915 MHz |
-| **BLE** | Host PC + `kitdd ble` | CSR / Windows BT adapter — active scan, GATT, export |
 | **LoRa** | ESP32 (optional) | E22 UART 915 MHz RX |
 
 ## Features
@@ -50,11 +69,12 @@ Join **`root` / `root-radar`** → open **http://192.168.4.1**
 | Layer | What you get |
 |-------|----------------|
 | **Wi‑Fi** | Probes, beacons, data, deauth — MAC, RSSI, SSID, channel, zone, vendor OUI, BSSID, encryption, per-type packet counts |
+| **Wi‑Fi LR** | SoftAP b/g/n+LR · ESP-NOW peer send/ping |
+| **BLE** | Onboard scan — address, name, RSSI, classify tags |
 | **Sub‑GHz** | CC1101 scan — remotes, sensors, fixed emitters, TPMS-class bursts |
-| **BLE** | Via `kitdd ble` — names, services, RSSI, parsed JSON to `~/dd-sessions` |
 | **LoRa** | E22 UART 915 MHz transparent RX |
 | **Dashboard** | Signal range map, device cards with field notes, copy/JSON, whitelist/blacklist |
-| **API** | JSON over HTTP — no device cap (PSRAM-backed hash table) |
+| **API** | JSON over HTTP — `ble` + `wifi_lr` flags on `/api/devices` |
 
 ## Hardware
 
@@ -91,7 +111,15 @@ Monitor serial at **115200**:
 pio device monitor -b 115200
 ```
 
-Serial commands: `status` · `rf` · `hop auto` · `hop <1-13>` · `help`
+Serial commands: `status` · `rf` · `hop auto` · `hop <1-13>` · `./omni …` · `help`
+
+### OmniScan (`./omni`)
+
+Interactive command interface over **Serial** and **HTTP** `POST /api/omni` `{"cmd":"./omni status"}`.
+
+Also available in **ARIA → Omni tab** (tool capabilities + live console).
+
+Examples: `./omni start` · `./omni status` · `./omni subghz raw` · `./omni wifi handshake` · `./omni system help`
 
 ## Use
 
@@ -115,6 +143,8 @@ Serial commands: `status` · `rf` · `hop auto` · `hop <1-13>` · `help`
 | `GET /api/sightings?mac=AA:BB:…` | RSSI/distance history for one MAC |
 | `GET /api/rf` | Sub‑GHz + LoRa driver status |
 | `GET /api/channel?ch=auto` or `?ch=6` | Wi‑Fi channel / hop mode |
+| `POST /api/omni` `{"cmd":"./omni status"}` | OmniScan command interface |
+| `GET /api/omni?cmd=./omni%20status` | Same via query string |
 
 Example:
 
@@ -123,20 +153,28 @@ curl -s http://192.168.4.1/api/rf | jq .
 curl -s http://192.168.4.1/api/devices | jq '.count, .devices[0]'
 ```
 
-### With DD / kitdd (BLE + merged session)
+### With DD / kitdd (optional host merge)
+
+Onboard BLE is already in `/api/devices` (`band=ble`). kitdd remains useful for host GATT extras or offline session merge:
 
 ```bash
 export KIT_ROOT=http://192.168.4.1
 
-kitdd wifi              # pull /api/devices from root
+kitdd wifi              # pull /api/devices from root (includes ble + wifi_lr flags)
 kitdd subghz            # sub-GHz snapshot
-kitdd ble               # BLE scan on host adapter → ~/dd-sessions
-kitdd ble -60           # 60s active BLE scan
-kitdd radar             # wifi + ble combined
+kitdd ble               # optional deeper host BT adapter scan → ~/dd-sessions
 kitdd session           # wifi + ble + subghz one-shot
 ```
 
-BLE does **not** run on the ESP32 — use a USB BT dongle (CSR) or Windows Bluetooth with `kitdd` on the same laptop/WSL session as root.
+### Omni BLE / Wi‑Fi LR
+
+```text
+./omni ble scan on
+./omni ble list
+./omni lr status
+./omni lr peer AA:BB:CC:DD:EE:FF
+./omni lr test
+```
 
 ## What's real vs estimated
 

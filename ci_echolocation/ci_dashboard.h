@@ -62,6 +62,7 @@ body{
 .band-pills{display:flex;gap:var(--s2);flex-wrap:wrap;font-size:var(--t-xs);font-family:var(--mono)}
 .band-pill{padding:var(--s1) var(--s2);border-radius:999px;border:1px solid var(--line);color:var(--muted);background:var(--glass);transition:border-color var(--ease),color var(--ease)}
 .band-pill.wifi{color:var(--accent);border-color:var(--accent-dim)}
+.band-pill.ble{color:#34d399;border-color:rgba(52,211,153,.28)}
 .band-pill.subghz{color:var(--subghz);border-color:rgba(251,146,60,.28)}
 .band-pill.lora{color:var(--lora);border-color:rgba(192,132,252,.28)}
 .band-pill-sub{font-size:10px;color:var(--muted-dim);font-weight:500}
@@ -306,6 +307,7 @@ body{
 }
 .dev-card.subghz::before{background:var(--subghz)}
 .dev-card.lora::before{background:var(--lora)}
+.dev-card.ble::before{background:#34d399}
 .dev-card.sel{border-color:var(--accent-dim);background:rgba(62,232,197,.08);box-shadow:0 0 0 1px rgba(62,232,197,.12)}
 .dev-card.trust-bl{border-color:rgba(248,113,113,.25)}
 .dev-card.trust-wl{border-color:rgba(107,163,255,.25)}
@@ -320,6 +322,7 @@ body{
   color:var(--muted);font-family:var(--mono);text-transform:lowercase;
 }
 .tag.wifi{color:var(--accent);border-color:var(--accent-dim)}
+.tag.ble{color:#34d399;border-color:rgba(52,211,153,.28)}
 .tag.subghz{color:var(--subghz);border-color:rgba(251,146,60,.28)}
 .tag.lora{color:var(--lora);border-color:rgba(192,132,252,.28)}
 .tag.ssid{max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -473,7 +476,7 @@ body{
         <div class="leg-row"><i style="background:#ff5959"></i> flagged</div>
       </div>
       <div class="radar-wrap"><canvas id="radar"></canvas></div>
-      <div class="radar-disclaimer"><b>Real:</b> RSSI, distance estimate, band, SSID, packets. <b>Not measured:</b> direction — dots spread around each ring for readability only.</div>
+      <div class="radar-disclaimer"><b>Real:</b> RSSI, 802.11 packet types, vendor OUI, BSSID, encryption, distance estimate. <b>Not measured:</b> direction — dots spread around each ring for readability only.</div>
       <div class="radar-tip" id="radarTip"></div>
     </div>
   </section>
@@ -486,6 +489,7 @@ body{
       <div class="filters-wrap">
         <div class="filters" id="filters">
           <span class="chip-hint">Filter</span>
+          <span class="chip" data-f="ble">BLE</span>
           <span class="chip" data-f="subghz">Sub-GHz</span>
           <span class="chip" data-f="fixed">Fixed RF</span>
           <span class="chip" data-f="lora">LoRa</span>
@@ -648,7 +652,7 @@ loadLists(); renderListEntries();
 const mob=()=>window.innerWidth<=720;
 for(let i=1;i<=13;i++){const o=document.createElement("option");o.value=i;o.textContent=i;chSel.appendChild(o);}
 
-const BANDS=new Set(["subghz","lora","wifi"]);
+const BANDS=new Set(["subghz","lora","wifi","ble"]);
 const FIXED_RF=/fixed emitter/i;
 const KINDS=new Set(["probe","beacon"]);
 const ZONES=new Set(["Near","Mid","Far"]);
@@ -742,17 +746,27 @@ const COPY_SVG='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strok
 
 function deviceCopyText(d){
   if(!d) return "";
+  const pkts=d.pkts||{};
+  const pktTotal=Number(d.seen_count||1);
   const lines=[
     "root device",
     "mac: "+(d.mac||""),
     "name: "+plainName(d),
     d.ssid?"ssid: "+d.ssid:"",
+    d.bssid?"bssid: "+d.bssid:"",
+    d.vendor?"vendor: "+d.vendor:"",
+    d.encrypt?"encrypt: "+d.encrypt:"",
     "band: "+(d.band||"wifi"),
     "kind: "+(d.kind||""),
     d.ch?"channel: "+d.ch:"",
     "rssi: "+Number(d.avg||d.rssi).toFixed(1)+" dBm",
     "distance: ~"+Number(d.distance_m||0).toFixed(1)+" m",
     "zone: "+(d.zone||""),
+    "pkts: "+pktTotal+(d.pkt_rate!=null?" @ "+Number(d.pkt_rate).toFixed(1)+"/s":""),
+    pkts.probe!=null?"  probe: "+pkts.probe:"",
+    pkts.beacon!=null?"  beacon: "+pkts.beacon:"",
+    pkts.data!=null?"  data: "+pkts.data:"",
+    pkts.deauth!=null?"  deauth: "+pkts.deauth:"",
     "seen: "+(d.seen_count||1)+"x",
     "last: "+fmtAge(d.last_seen_ms||0),
     "coords: "+fmtCoords(d)
@@ -826,6 +840,7 @@ function zoneExplain(z,m){
 function deviceWhatIs(d){
   const band=d.band||"wifi";
   if(band==="lora") return "LoRa transmitter or sensor on 915 MHz.";
+  if(band==="ble") return (d.ssid&&d.ssid.trim())?d.ssid.trim():"Bluetooth LE advertiser";
   if(band==="subghz") return (d.ssid&&d.ssid.trim())?d.ssid.trim():"Sub-GHz emitter — remote, sensor, or fixed RF.";
   if(d.ssid&&d.ssid.trim()) return "Wi-Fi device associated with «"+d.ssid.trim()+"».";
   if(d.kind==="probe") return "Device probing for networks — often a phone or laptop.";
@@ -840,17 +855,28 @@ function renderDeviceFields(d){
   const rssiRaw=d.avg!=null?d.avg:d.rssi;
   const rssi=Number.isFinite(Number(rssiRaw))?Number(rssiRaw).toFixed(1)+" dBm":"—";
   const dist=Number(d.distance_m||0).toFixed(1);
+  const pkts=d.pkts||{};
+  const pktLine=[
+    pkts.probe?"probe "+pkts.probe:null,
+    pkts.beacon?"beacon "+pkts.beacon:null,
+    pkts.data?"data "+pkts.data:null,
+    pkts.deauth?"deauth "+pkts.deauth:null
+  ].filter(Boolean).join(" · ");
   let html="";
   html+=kvRow("MAC",d.mac||"—");
   if(d.rand) html+=kvRow("Privacy","Randomized");
+  if(d.vendor) html+=kvRow("Vendor",String(d.vendor).replace(/</g,"&lt;"));
   html+=kvRow("Band",band);
   html+=kvRow("Type",kind);
   if(d.ssid&&d.ssid.trim()) html+=kvRow("SSID / label",d.ssid.replace(/</g,"&lt;"));
+  if(d.bssid&&d.bssid.trim()) html+=kvRow("BSSID",d.bssid);
+  if(d.encrypt) html+=kvRow("Encrypt",String(d.encrypt).replace(/</g,"&lt;"));
   if(d.ch) html+=kvRow("Channel","ch"+d.ch);
   html+=kvRow("RSSI",rssi);
   html+=kvRow("Distance","~"+dist+" m");
   html+=kvRow("Zone",z);
-  html+=kvRow("Seen",(d.seen_count||1)+"×");
+  html+=kvRow("Packets",(d.seen_count||1)+"×"+(d.pkt_rate!=null?" · "+Number(d.pkt_rate).toFixed(1)+"/s":""));
+  if(pktLine) html+=kvRow("802.11 mix",pktLine);
   html+=kvRow("Last heard",fmtAge(d.last_seen_ms||0));
   if((d.gps===true||d.gps==="true")&&d.lat&&d.lon){
     html+=kvRow("GPS",Number(d.lat).toFixed(5)+", "+Number(d.lon).toFixed(5));
@@ -862,7 +888,7 @@ function renderDeviceCard(d,opts){
   const trust=deviceTrust(d);
   const tcl=trust==="blacklist"?" trust-bl":trust==="whitelist"?" trust-wl":"";
   const sel=d.mac===selectedMac?" sel":"";
-  const bandCls=d.band==="lora"?" lora":d.band==="subghz"?" subghz":"";
+  const bandCls=d.band==="lora"?" lora":d.band==="subghz"?" subghz":d.band==="ble"?" ble":"";
   const macEsc=(d.mac||"").replace(/"/g,"&quot;");
   const band=d.band||"wifi",kind=d.kind||"?",z=d.zone||"Far";
   const rssiRaw=d.avg!=null?d.avg:d.rssi;
@@ -872,6 +898,8 @@ function renderDeviceCard(d,opts){
     '<span class="tag">'+kind+'</span>'+
     '<span class="tag">'+rssi+'</span>'+
     '<span class="tag">'+z+'</span>'+
+    (d.vendor?'<span class="tag">'+String(d.vendor).replace(/</g,"&lt;")+'</span>':"")+
+    (d.seen_count?'<span class="tag">'+(d.seen_count||1)+' pkts</span>':"")+
     (d.ssid&&d.ssid.trim()?'<span class="tag ssid">'+d.ssid.replace(/</g,"&lt;")+'</span>':"");
   return '<div class="dev-card'+tcl+sel+bandCls+'" data-mac="'+macEsc+'">'+
     '<div class="dev-card-main">'+
@@ -890,6 +918,7 @@ function renderDeviceCard(d,opts){
 }
 
 function plainName(d){
+  if(d.band==="ble") return d.ssid&&d.ssid.trim()?d.ssid.trim():"BLE device";
   if(d.ssid&&d.ssid.trim()) return d.ssid.trim();
   if(d.band==="subghz"){
     if(d.ssid&&d.ssid.includes("fixed emitter")) return d.ssid.trim();
@@ -922,6 +951,7 @@ function zoneColor(z){return z==="Near"?"var(--near)":z==="Mid"?"var(--mid)":"va
 function bandColor(d){
   if(d.band==="lora") return "#c084fc";
   if(d.band==="subghz") return "#fb923c";
+  if(d.band==="ble") return "#34d399";
   return zoneColor(d.zone||"Far");
 }
 function mergeDevices(incoming){
@@ -973,16 +1003,17 @@ function loraListening(){
   return pk>0||uart>0||active<30000;
 }
 function bandCounts(){
-  let wifi=0,subghz=0,lora=0;
+  let wifi=0,ble=0,subghz=0,lora=0;
   for(const d of listDevices()){
     if(isLoraListener(d)) continue;
     if(d.band==="subghz") subghz++;
     else if(d.band==="lora") lora++;
+    else if(d.band==="ble") ble++;
     else wifi++;
   }
   const bands=rfBandLiveCount();
   const loListen=(rfMeta.lora&&rfMeta.lora.ready)?1:0;
-  return {wifi,subghz,lora,bands,loListen};
+  return {wifi,ble,subghz,lora,bands,loListen};
 }
 function renderBandPills(){
   const el=document.getElementById("bandPills");
@@ -1017,6 +1048,7 @@ function renderBandPills(){
   }
   el.innerHTML=
     '<span class="band-pill wifi">'+c.wifi+' Wi‑Fi</span>'+
+    '<span class="band-pill ble">'+c.ble+' BLE</span>'+
     '<span class="band-pill subghz" title="Emitters in list · band noise floor in RF monitor">'+
       sgMain+(sgSub?' <span class="band-pill-sub">'+sgSub+'</span>':"")+' Sub‑GHz</span>'+
     '<span class="band-pill lora" title="LoRa packets + LR22 monitor">'+
@@ -1113,7 +1145,7 @@ function matchesWith(d,filters,qOverride){
 function matches(d){return matchesWith(d,activeFilters,null);}
 function sorted(a){return [...a].sort((x,y)=>zoneRank(x.zone)-zoneRank(y.zone)||(x.distance_m||99)-(y.distance_m||99));}
 
-const FILTER_NAMES={subghz:"Sub-GHz",fixed:"Fixed RF",lora:"LoRa",probe:"Phones",beacon:"Wi-Fi",Near:"Close",Mid:"Near",Far:"Far",fresh:"Recent",whitelist:"Whitelist",flagged:"Flagged"};
+const FILTER_NAMES={ble:"BLE",subghz:"Sub-GHz",fixed:"Fixed RF",lora:"LoRa",probe:"Phones",beacon:"Wi-Fi",Near:"Close",Mid:"Near",Far:"Far",fresh:"Recent",whitelist:"Whitelist",flagged:"Flagged"};
 function filterSummary(){
   return [...activeFilters].map(f=>FILTER_NAMES[f]||f).join(" · ");
 }
