@@ -55,16 +55,19 @@
 #define ROOT_LORA_MIN_BYTES 3
 #endif
 
-#define ROOT_SUBGHZ_DWELL_MS 550
-#define ROOT_SUBGHZ_SAMPLE_US 1200
-#define ROOT_SUBGHZ_SAMPLES 28
-#define ROOT_SUBGHZ_BURST_DB 3
-#define ROOT_SUBGHZ_CARRIER_DB 6
-#define ROOT_SUBGHZ_CARRIER_MS 900
+// Default hop dwell (overridden per-slot for OOK remotes in rf_subghz.cpp)
+#define ROOT_SUBGHZ_DWELL_MS 400
+// Fast RSSI energy detect — car remotes are ~20–200 ms OOK bursts
+#define ROOT_SUBGHZ_SAMPLE_US 200
+#define ROOT_SUBGHZ_SAMPLES 40
+// Peak must clear noise by this many dB (real TX, not register flicker)
+#define ROOT_SUBGHZ_BURST_DB 8
+#define ROOT_SUBGHZ_CARRIER_DB 12
+#define ROOT_SUBGHZ_CARRIER_MS 800
 #define ROOT_SUBGHZ_RSSI_FLOOR -110
-// Show live band scan on dashboard when peak RSSI exceeds this (dBm)
-#define ROOT_SUBGHZ_ACTIVITY_RSSI -108
-#define ROOT_SUBGHZ_EMIT_GAP_MS 350
+#define ROOT_SUBGHZ_ACTIVITY_RSSI -105
+// Min gap between emitted hits on same slot (ms)
+#define ROOT_SUBGHZ_EMIT_GAP_MS 180
 #define ROOT_SUBGHZ_STALE_MS 180000
 #define ROOT_LORA_STALE_MS 180000
 
@@ -97,16 +100,33 @@
 #ifndef ROOT_AP_CHANNEL
 #define ROOT_AP_CHANNEL 1
 #endif
+// US 2.4 GHz scan set (promiscuous hop)
+#ifndef ROOT_WIFI_CH_MIN
+#define ROOT_WIFI_CH_MIN 1
+#endif
+#ifndef ROOT_WIFI_CH_MAX
+#define ROOT_WIFI_CH_MAX 11
+#endif
 // esp_wifi_set_max_tx_power units: 0.25 dBm (78 ≈ 19.5 dBm, legal US max)
 #ifndef ROOT_WIFI_TX_QUARTER_DBM
 #define ROOT_WIFI_TX_QUARTER_DBM 78
 #endif
-// When channel hopping: stay on AP channel long enough for phones to see/join SoftAP.
+// Channel hop: equal dwell across US 1–11 so the sniffer actually sees every channel.
+// SoftAP moves with the radio (single 2.4 GHz PHY) — brief glitches are expected.
+#ifndef ROOT_HOP_DWELL_MS
+#define ROOT_HOP_DWELL_MS 220
+#endif
 #ifndef ROOT_HOP_HOME_DWELL_MS
-#define ROOT_HOP_HOME_DWELL_MS 4500
+#define ROOT_HOP_HOME_DWELL_MS ROOT_HOP_DWELL_MS
 #endif
 #ifndef ROOT_HOP_AWAY_DWELL_MS
-#define ROOT_HOP_AWAY_DWELL_MS 120
+#define ROOT_HOP_AWAY_DWELL_MS ROOT_HOP_DWELL_MS
+#endif
+#ifndef ROOT_HOP_HOME_CLIENT_MS
+#define ROOT_HOP_HOME_CLIENT_MS ROOT_HOP_DWELL_MS
+#endif
+#ifndef ROOT_HOP_AWAY_CLIENT_MS
+#define ROOT_HOP_AWAY_CLIENT_MS ROOT_HOP_DWELL_MS
 #endif
 
 // 0 = no API cap (return every tracked device)

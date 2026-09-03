@@ -654,7 +654,7 @@ function renderListEntries(){
 }
 loadLists(); renderListEntries();
 const mob=()=>window.innerWidth<=720;
-for(let i=1;i<=13;i++){const o=document.createElement("option");o.value=i;o.textContent=i;chSel.appendChild(o);}
+for(let i=1;i<=11;i++){const o=document.createElement("option");o.value=i;o.textContent=i;chSel.appendChild(o);}
 
 const BANDS=new Set(["subghz","lora","wifi","ble"]);
 const FIXED_RF=/fixed emitter/i;
@@ -830,7 +830,7 @@ function kindExplain(k){
 function bandExplain(b){
   const m={
     wifi:"2.4 GHz Wi-Fi (passive promiscuous). Listen-only — no transmit.",
-    subghz:"CC1101: 315/433 OOK+FSK and 868/915 FSK — bursts, carriers, packets.",
+    subghz:"CC1101: 315/433/868 OOK+FSK energy scan — remotes, sensors, carriers.",
     lora:"E22 transparent UART @ 915 MHz — real payloads only (noise filtered)."
   };
   return m[b]||"RF band this hit was sorted into.";

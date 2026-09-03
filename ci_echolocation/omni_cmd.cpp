@@ -131,7 +131,7 @@ static void cmdStart(char* out, size_t n, size_t* u) {
                  : "BLE: OFF — ./omni ble scan on\n");
   if (s.subghzOn) {
     if (s.subghzHopping)
-      append(out, n, u, "Sub-GHz: Hopping 315→433→868→915 MHz\n");
+      append(out, n, u, "Sub-GHz: Hopping 315→433→868 MHz\n");
     else
       appendf(out, n, u, "Sub-GHz: Fixed %.2f MHz\n", s.subghzFreqMhz);
   } else {
@@ -165,12 +165,16 @@ static void cmdStop(char* out, size_t n, size_t* u) {
   }
   gH->setRunning(false);
   append(out, n, u, "OmniScan stopping...\n");
-  if (gH->logSave) {
+    if (gH->logSave) {
     char path[80];
     if (gH->logSave(path, sizeof path))
-      appendf(out, n, u, "Saving logs...\nData saved: %s\n", path);
+      appendf(out, n, u,
+              "Saving logs...\nData saved: %s\n"
+              "Download: http://192.168.4.1/api/export\n"
+              "(PSRAM only — gone on reboot; not an SD/Windows path)\n",
+              path);
     else
-      append(out, n, u, "Saving session snapshot...\n");
+      append(out, n, u, "Saving session snapshot...\nERROR: save failed\n");
   }
   append(out, n, u, "Status: STOPPED\n");
 }
@@ -428,7 +432,7 @@ bool omniHandle(const char* lineIn, char* out, size_t outn) {
     }
     if (tokEq(t1, "hop")) {
       if (gH->setSubghzFreq) gH->setSubghzFreq(0);
-      append(out, outn, &u, "Sub-GHz hopping enabled: 315→433→868→915 MHz\n");
+      append(out, outn, &u, "Sub-GHz hopping enabled: 315→433→868 MHz\n");
       return true;
     }
     if (tokEq(t1, "list")) return gH->subghzList && gH->subghzList(out, outn);
@@ -613,7 +617,12 @@ bool omniHandle(const char* lineIn, char* out, size_t outn) {
       char path[80] = "";
       if (gH->logSave) gH->logSave(path, sizeof path);
       append(out, outn, &u, "Saving...\n");
-      if (path[0]) appendf(out, outn, &u, "File: %s\n", path);
+      if (path[0]) {
+        appendf(out, outn, &u, "File: %s\n", path);
+        append(out, outn, &u,
+               "Download: http://192.168.4.1/api/export\n"
+               "(in ESP32 PSRAM — open that URL while joined to SoftAP root)\n");
+      }
       append(out, outn, &u, "Done.\n");
       return true;
     }

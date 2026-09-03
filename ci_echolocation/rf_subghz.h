@@ -16,7 +16,7 @@ struct SubGhzHit {
   uint8_t mac[6];
   char band[8];
   char label[48];
-  char detail[40];   // hex / mode snippet for UI
+  char detail[64];   // hex / mode snippet for UI
   SubGhzDetect detect;
 };
 

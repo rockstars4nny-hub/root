@@ -14,8 +14,9 @@
 #include <esp_heap_caps.h>
 #include "root_gps.h"
 
-static SPIClass gSpi(HSPI);
-static CC1101 gRadio = new Module(ROOT_CC1101_CS, ROOT_CC1101_GDO0, -1, -1);
+static SPIClass gSpi(FSPI);
+static Module* gMod = nullptr;
+static CC1101* gRadio = nullptr;
 static bool gOk = false;
 static bool gEnabled = true;
 static bool gHopping = true;
@@ -24,24 +25,33 @@ static float gFixedMhz = 433.92f;
 struct ScanSlot {
   float mhz;
   bool ook;
+  uint16_t dwellMs;  // longer on OOK — key fobs are short bursts
   const char* name;
 };
-// 315/433 visited as OOK (remotes) and FSK; 868/915 FSK only.
+// Equal OOK energy dwell on 315 / 433.92 / 868 — remotes live on all three.
+// Short FSK passes after; 915 stays on the E22 LoRa path (not starved here).
 static const ScanSlot SLOTS[] = {
-    {315.0f, true, "315"},  {315.0f, false, "315"},
-    {433.92f, true, "433"}, {433.92f, false, "433"},
-    {868.0f, false, "868"}, {915.0f, false, "915"},
+    {315.00f, true, 1200, "315"},
+    {433.92f, true, 1200, "433"},
+    {868.00f, true, 1200, "868"},
+    {315.00f, false, 220, "315"},
+    {433.92f, false, 220, "433"},
+    {868.00f, false, 220, "868"},
 };
 static const uint8_t SLOT_N = sizeof(SLOTS) / sizeof(SLOTS[0]);
 
 struct BandCal {
   float noiseEma = -110.0f;
   int8_t peakRssi = -120;
+  int8_t eventPeak = -120;
   uint32_t carrierMs = 0;
   uint16_t bursts = 0;
   uint16_t packets = 0;
   uint32_t lastHitMs = 0;
   uint32_t lastEmitMs = 0;
+  bool inBurst = false;
+  bool emittedThisBurst = false;
+  uint8_t hotSamples = 0;
 };
 
 static BandCal gCal[SLOT_N];
@@ -50,6 +60,7 @@ static uint32_t gBandEnterMs = 0;
 static uint32_t gLastStatusMs = 0;
 static uint32_t gTotalBursts = 0;
 static bool gCurrentOok = false;
+static uint32_t gHitSeq = 0;
 
 static SubGhzHit gHitQ[24];
 static uint8_t gHitHead = 0;
@@ -73,14 +84,15 @@ static void pushHit(const SubGhzHit& h) {
 }
 
 static void synthMac(uint8_t* mac, uint32_t freqKhz, SubGhzDetect det, int8_t rssi) {
-  // Locally administered unicast (02:53:…) — visible in the device list.
+  // Unique-ish per detection so presses don't collapse into one fake constant-RSSI row.
+  gHitSeq++;
   mac[0] = 0x02;
   mac[1] = 0x53;
-  const uint8_t bucket = (uint8_t)(((int)rssi + 120) / 3);  // ~3 dB buckets
-  mac[2] = (uint8_t)((freqKhz >> 16) & 0xff);
-  mac[3] = (uint8_t)((freqKhz >> 8) & 0xff);
-  mac[4] = (uint8_t)(freqKhz & 0xff);
-  mac[5] = (uint8_t)(((det & 0x07) << 5) | (bucket & 0x1f));
+  mac[2] = (uint8_t)((freqKhz >> 8) & 0xff);
+  mac[3] = (uint8_t)(freqKhz & 0xff);
+  mac[4] = (uint8_t)(((det & 0x03) << 6) | (((uint8_t)rssi) & 0x3f));
+  mac[5] = (uint8_t)(gHitSeq & 0xff);
+  if (mac[5] < 4) mac[5] |= 0x10;
 }
 
 static void synthMacFromPayload(uint8_t* mac, uint32_t freqKhz, const uint8_t* data,
@@ -96,55 +108,70 @@ static void synthMacFromPayload(uint8_t* mac, uint32_t freqKhz, const uint8_t* d
   mac[3] = (uint8_t)(h >> 16);
   mac[4] = (uint8_t)(h >> 8);
   mac[5] = (uint8_t)h;
-  if (mac[5] < 4) mac[5] |= 0x10;  // avoid activity monitor slots 0-3
+  if (mac[5] < 4) mac[5] |= 0x10;
 }
 
 static void labelHit(SubGhzHit& h, bool ook) {
   const float mhz = h.freqKhz / 1000.0f;
-  const int above = h.rssi - h.noiseFloor;
+  const int above = (int)h.rssi - (int)h.noiseFloor;
   const char* mode = ook ? "OOK" : "FSK";
   const char* kind =
       h.detect == SG_CARRIER ? "carrier" : h.detect == SG_PACKET ? "packet" : "burst";
-  snprintf(h.label, sizeof(h.label), "%.2f %s %s %+ddB", mhz, mode, kind, above);
+  snprintf(h.label, sizeof(h.label), "%.2f %s %s %ddBm", mhz, mode, kind, (int)h.rssi);
   if (!h.detail[0]) {
-    snprintf(h.detail, sizeof(h.detail), "nf %d · %s", (int)h.noiseFloor, kind);
+    snprintf(h.detail, sizeof(h.detail), "nf %d | %+ddB | %s", (int)h.noiseFloor, above,
+             mode);
   }
+}
+
+static int8_t readRssiDbm() {
+  if (!gRadio) return -120;
+  // After receiveDirectAsync(), getRSSI() reads the live RSSI register.
+  // In packet mode it returns a stale last-packet cache (identical fake values).
+  float r = gRadio->getRSSI();
+  if (!isfinite(r)) return -120;
+  int v = (int)lroundf(r);
+  if (v < -128) v = -128;
+  if (v > 0) v = 0;
+  return (int8_t)v;
 }
 
 static void configureSlot(const ScanSlot& sl) {
-  gRadio.setFrequency(sl.mhz);
+  if (!gRadio) return;
   gCurrentOok = sl.ook;
-  gRadio.setOOK(sl.ook);
+  gRadio->standby();
+  gRadio->setFrequency(sl.mhz);
+  gRadio->setOOK(sl.ook);
+  // Wide RX BW for remotes. Always direct RX so RSSI is live (packet-mode RSSI is cached junk).
   if (sl.ook) {
-    gRadio.setRxBandwidth(270.0f);
-    gRadio.setBitRate(2.4f);
-    gRadio.setFrequencyDeviation(0.0f);
+    gRadio->setRxBandwidth(sl.mhz >= 800.0f ? 406.0f : 650.0f);
+    gRadio->setBitRate(4.8f);
+    gRadio->setFrequencyDeviation(0.0f);
   } else if (sl.mhz < 350.0f) {
-    gRadio.setRxBandwidth(203.0f);
-    gRadio.setBitRate(1.2f);
-    gRadio.setFrequencyDeviation(5.2f);
+    gRadio->setRxBandwidth(203.0f);
+    gRadio->setBitRate(1.2f);
+    gRadio->setFrequencyDeviation(5.2f);
   } else if (sl.mhz < 500.0f) {
-    gRadio.setRxBandwidth(135.0f);
-    gRadio.setBitRate(4.8f);
-    gRadio.setFrequencyDeviation(25.0f);
-  } else if (sl.mhz < 900.0f) {
-    gRadio.setRxBandwidth(101.0f);
-    gRadio.setBitRate(4.8f);
-    gRadio.setFrequencyDeviation(45.0f);
+    gRadio->setRxBandwidth(270.0f);
+    gRadio->setBitRate(4.8f);
+    gRadio->setFrequencyDeviation(25.0f);
   } else {
-    gRadio.setRxBandwidth(81.0f);
-    gRadio.setBitRate(4.8f);
-    gRadio.setFrequencyDeviation(45.0f);
+    // 868 FSK
+    gRadio->setRxBandwidth(203.0f);
+    gRadio->setBitRate(4.8f);
+    gRadio->setFrequencyDeviation(45.0f);
   }
-  gRadio.startReceive();
+  gRadio->setCrcFiltering(false);
+  // Direct async RX: live RSSI + OOK energy for key fobs (no FIFO sync needed)
+  gRadio->receiveDirectAsync();
 }
 
 static void configureBand(float mhz) {
-  ScanSlot sl = {mhz, mhz < 500.0f, "fix"};
-  if (mhz >= 800.0f && mhz < 900.0f) sl = {868.0f, false, "868"};
-  else if (mhz >= 900.0f) sl = {915.0f, false, "915"};
-  else if (mhz < 350.0f) sl = {315.0f, true, "315"};
-  else sl = {433.92f, true, "433"};
+  ScanSlot sl = {mhz, true, 1200, "fix"};
+  if (mhz >= 800.0f && mhz < 900.0f) sl = {868.0f, true, 1200, "868"};
+  else if (mhz >= 900.0f) sl = {915.0f, false, 400, "915"};
+  else if (mhz < 350.0f) sl = {315.0f, true, 1200, "315"};
+  else sl = {433.92f, true, 1200, "433"};
   configureSlot(sl);
 }
 
@@ -170,52 +197,9 @@ static void pushRaw(float mhz, int8_t rssi, uint8_t lqi, const uint8_t* data, ui
 }
 
 static void tryReadPacket(uint8_t si) {
-  if (!gOk || !gEnabled) return;
-  size_t len = gRadio.getPacketLength(true);
-  if (len == 0 || len > 255) {
-    int16_t av = gRadio.available();
-    if (av <= 0) return;
-    len = (size_t)av;
-  }
-  uint8_t buf[ROOT_SUBGHZ_RAW_BYTES];
-  size_t want = len > ROOT_SUBGHZ_RAW_BYTES ? ROOT_SUBGHZ_RAW_BYTES : len;
-  int16_t rd = gRadio.readData(buf, want);
-  if (rd != RADIOLIB_ERR_NONE) {
-    gRadio.startReceive();
-    return;
-  }
-  if (want == 0) {
-    gRadio.startReceive();
-    return;
-  }
-  int8_t rssi = gRadio.getRSSI();
-  uint8_t lqi = (uint8_t)gRadio.getLQI();
-  const float mhz = SLOTS[si].mhz;
-  pushRaw(mhz, rssi, lqi, buf, (uint8_t)want);
-  gCal[si].packets++;
-  gTotalBursts++;
-
-  // Promote demod payload to a device hit with payload-derived MAC + hex detail
-  BandCal& c = gCal[si];
-  SubGhzHit h = {};
-  h.freqKhz = (uint32_t)(mhz * 1000.0f);
-  h.rssi = rssi;
-  h.noiseFloor = (int8_t)c.noiseEma;
-  h.detect = SG_PACKET;
-  strncpy(h.band, SLOTS[si].name, sizeof h.band - 1);
-  synthMacFromPayload(h.mac, h.freqKhz, buf, want);
-  size_t di = 0;
-  di += (size_t)snprintf(h.detail + di, sizeof(h.detail) - di, "%uB LQI%u ",
-                         (unsigned)want, (unsigned)lqi);
-  for (size_t i = 0; i < want && di + 3 < sizeof(h.detail); i++) {
-    di += (size_t)snprintf(h.detail + di, sizeof(h.detail) - di, "%02X", buf[i]);
-    if (i + 1 < want && di + 1 < sizeof(h.detail)) h.detail[di++] = ' ';
-  }
-  labelHit(h, gCurrentOok);
-  pushHit(h);
-  c.lastHitMs = millis();
-  c.lastEmitMs = millis();
-  gRadio.startReceive();
+  // Hopping scanner stays in direct RX for live RSSI / OOK energy.
+  // Packet FIFO demod needs fixed-freq startReceive — skip during energy scan.
+  (void)si;
 }
 
 bool subghzReady() { return gOk; }
@@ -279,12 +263,25 @@ bool subghzRawGet(uint32_t newestIndex, SubGhzRawPacket* out) {
 }
 
 void subghzInit() {
-  gSpi.begin(ROOT_SPI_SCK, ROOT_SPI_MISO, ROOT_SPI_MOSI, ROOT_CC1101_CS);
   pinMode(ROOT_CC1101_GDO0, INPUT);
-  const int16_t st = gRadio.begin(433.92);
+  gSpi.begin(ROOT_SPI_SCK, ROOT_SPI_MISO, ROOT_SPI_MOSI, ROOT_CC1101_CS);
+
+  if (gRadio) {
+    delete gRadio;
+    gRadio = nullptr;
+  }
+  if (gMod) {
+    delete gMod;
+    gMod = nullptr;
+  }
+  // Must pass the same SPI bus we began — default SPI was a silent miss on S3.
+  gMod = new Module(ROOT_CC1101_CS, ROOT_CC1101_GDO0, RADIOLIB_NC, RADIOLIB_NC, gSpi);
+  gRadio = new CC1101(gMod);
+
+  const int16_t st = gRadio->begin(433.92);
   if (st != RADIOLIB_ERR_NONE) {
-    Serial.printf("root: CC1101 init failed (%d) — check SPI CS=%d\n",
-                  (int)st, ROOT_CC1101_CS);
+    Serial.printf("root: CC1101 init failed (%d) — check SPI CS=%d SCK=%d MOSI=%d MISO=%d\n",
+                  (int)st, ROOT_CC1101_CS, ROOT_SPI_SCK, ROOT_SPI_MOSI, ROOT_SPI_MISO);
     gOk = false;
     return;
   }
@@ -293,6 +290,7 @@ void subghzInit() {
   gHopping = true;
   gSlotIdx = 0;
   gBandEnterMs = millis();
+  for (uint8_t i = 0; i < SLOT_N; i++) gCal[i] = BandCal{};
   configureSlot(SLOTS[0]);
 
   gRawCap = ROOT_SUBGHZ_RAW_CAP;
@@ -309,19 +307,43 @@ void subghzInit() {
   gRawCount = 0;
   gRawTotal = 0;
 
-  Serial.printf("root: CC1101 scanner 315/433 OOK+FSK · 868/915 FSK (CS=%d GDO0=%d) raw_cap=%u\n",
-                ROOT_CC1101_CS, ROOT_CC1101_GDO0, (unsigned)gRawCap);
+  // Sanity: RSSI must move a little in RX; stuck value ⇒ SPI/wiring still wrong.
+  int8_t r0 = readRssiDbm();
+  delay(2);
+  int8_t r1 = readRssiDbm();
+  Serial.printf("root: CC1101 OK · OOK energy 315/433/868 (1.2s each) + FSK · "
+                "RSSI now %d/%d dBm (CS=%d GDO0=%d)\n",
+                (int)r0, (int)r1, ROOT_CC1101_CS, ROOT_CC1101_GDO0);
 }
 
 static void emit(BandCal& c, uint8_t si, uint32_t freqKhz, int8_t rssi,
                  SubGhzDetect det) {
   const int8_t floor = (int8_t)c.noiseEma;
-  const int delta = rssi - floor;
+  const int delta = (int)rssi - (int)floor;
   if (delta < ROOT_SUBGHZ_BURST_DB) return;
   const uint32_t now = millis();
   if (c.lastEmitMs && (now - c.lastEmitMs) < ROOT_SUBGHZ_EMIT_GAP_MS &&
       det != SG_PACKET) {
     return;
+  }
+
+  // Sample GDO0 async data line → raw hex (OOK remotes / energy bursts)
+  uint8_t raw[ROOT_SUBGHZ_RAW_BYTES];
+  uint8_t rawLen = 0;
+  if (gCurrentOok || det == SG_BURST) {
+    uint8_t acc = 0;
+    uint8_t bit = 0;
+    // ~50 µs/bit ≈ 20 kbaud · 64 bytes ≈ 25 ms of airtime
+    const size_t wantBits = 64 * 8;
+    for (size_t i = 0; i < wantBits && rawLen < ROOT_SUBGHZ_RAW_BYTES; i++) {
+      if (digitalRead(ROOT_CC1101_GDO0)) acc |= (uint8_t)(1u << (7 - bit));
+      if (++bit >= 8) {
+        raw[rawLen++] = acc;
+        acc = 0;
+        bit = 0;
+      }
+      delayMicroseconds(50);
+    }
   }
 
   SubGhzHit h = {};
@@ -330,59 +352,92 @@ static void emit(BandCal& c, uint8_t si, uint32_t freqKhz, int8_t rssi,
   h.noiseFloor = floor;
   h.detect = det;
   strncpy(h.band, SLOTS[si].name, sizeof h.band - 1);
-  synthMac(h.mac, freqKhz, det, rssi);
+  if (rawLen) {
+    synthMacFromPayload(h.mac, freqKhz, raw, rawLen);
+    pushRaw(SLOTS[si].mhz, rssi, 0, raw, rawLen);
+    size_t di = 0;
+    di += (size_t)snprintf(h.detail + di, sizeof(h.detail) - di, "%uB ",
+                           (unsigned)rawLen);
+    for (uint8_t i = 0; i < rawLen && di + 3 < sizeof(h.detail); i++) {
+      di += (size_t)snprintf(h.detail + di, sizeof(h.detail) - di, "%02X", raw[i]);
+      if (i + 1 < rawLen && di + 1 < sizeof(h.detail) && i < 15) h.detail[di++] = ' ';
+      if (i >= 15) {
+        if (di + 3 < sizeof(h.detail)) {
+          h.detail[di++] = '.';
+          h.detail[di++] = '.';
+          h.detail[di] = 0;
+        }
+        break;
+      }
+    }
+  } else {
+    synthMac(h.mac, freqKhz, det, rssi);
+    snprintf(h.detail, sizeof(h.detail), "nf %d | %+ddB | %s", (int)floor, delta,
+             gCurrentOok ? "OOK" : "FSK");
+  }
   labelHit(h, gCurrentOok);
   pushHit(h);
   c.lastHitMs = now;
   c.lastEmitMs = now;
+  c.bursts++;
   gTotalBursts++;
 
-  if (det != SG_PACKET) {
-    uint8_t syn[16] = {0x02, 0x53, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-    syn[2] = (uint8_t)(freqKhz >> 16);
-    syn[3] = (uint8_t)(freqKhz >> 8);
-    syn[4] = (uint8_t)freqKhz;
-    syn[5] = (uint8_t)det;
-    syn[6] = (uint8_t)rssi;
-    syn[7] = (uint8_t)floor;
-    syn[8] = gCurrentOok ? 1 : 0;
-    pushRaw(SLOTS[si].mhz, rssi, 0, syn, 12);
-  }
+  Serial.printf("root: subghz HIT %.2f %s %s peak=%d nf=%d (+%d) hex=%s\n",
+                SLOTS[si].mhz, gCurrentOok ? "OOK" : "FSK",
+                det == SG_CARRIER ? "carrier" : det == SG_PACKET ? "packet" : "burst",
+                (int)rssi, (int)floor, delta, h.detail);
 }
 
 static void sampleBand(uint8_t si, uint32_t nowMs) {
+  if (!gRadio) return;
   BandCal& c = gCal[si];
-  const uint32_t freqKhz = (uint32_t)(SLOTS[si].mhz * 1000.0f);
+  const uint32_t freqKhz = (uint32_t)lroundf(SLOTS[si].mhz * 1000.0f);
   int8_t peak = -120;
-  uint8_t pktEdges = 0;
-  bool gdoHigh = false;
+  int8_t quiet = 127;
+  uint8_t above = 0;
 
+  // ~8 ms energy window (SAMPLES × SAMPLE_US) — catch short key-fob chirps
   for (uint8_t s = 0; s < ROOT_SUBGHZ_SAMPLES; s++) {
-    const int8_t rssi = gRadio.getRSSI();
+    const int8_t rssi = readRssiDbm();
     if (rssi > peak) peak = rssi;
+    if (rssi < quiet) quiet = rssi;
+
     if (c.noiseEma < -99.0f) {
       c.noiseEma = (float)rssi;
-    } else if (rssi <= c.noiseEma + 3) {
-      c.noiseEma = c.noiseEma * 0.92f + (float)rssi * 0.08f;
+    } else if (rssi <= (int8_t)(c.noiseEma + 2.0f)) {
+      // Only quiet samples train the floor — never chase a TX peak upward
+      c.noiseEma = c.noiseEma * 0.90f + (float)rssi * 0.10f;
     }
-    if (digitalRead(ROOT_CC1101_GDO0)) {
-      gdoHigh = true;
-      pktEdges++;
-    }
+
+    if (rssi >= (int8_t)(c.noiseEma + ROOT_SUBGHZ_BURST_DB)) above++;
     delayMicroseconds(ROOT_SUBGHZ_SAMPLE_US);
   }
 
   c.peakRssi = peak;
-  const int delta = peak - (int8_t)c.noiseEma;
+  const int delta = (int)peak - (int)c.noiseEma;
 
-  tryReadPacket(si);
+  // FSK packet RX only (does not thrash OOK energy RX)
+  if (!gCurrentOok) tryReadPacket(si);
 
-  if (gdoHigh && pktEdges >= 2) {
-    c.packets++;
-    emit(c, si, freqKhz, peak, SG_PACKET);
-  } else if (delta >= ROOT_SUBGHZ_BURST_DB) {
-    c.bursts++;
-    emit(c, si, freqKhz, peak, SG_BURST);
+  if (delta >= ROOT_SUBGHZ_BURST_DB && above >= 3) {
+    if (peak > c.eventPeak) c.eventPeak = peak;
+    if (!c.inBurst) {
+      c.inBurst = true;
+      c.emittedThisBurst = false;
+      c.hotSamples = 1;
+    } else if (c.hotSamples < 255) {
+      c.hotSamples++;
+    }
+    // Require 2 consecutive hot windows (~16 ms) so register flicker doesn't fire
+    if (!c.emittedThisBurst && c.hotSamples >= 2) {
+      emit(c, si, freqKhz, c.eventPeak > peak ? c.eventPeak : peak, SG_BURST);
+      c.emittedThisBurst = true;
+    }
+  } else {
+    c.inBurst = false;
+    c.emittedThisBurst = false;
+    c.eventPeak = -120;
+    c.hotSamples = 0;
   }
 
   if (delta >= ROOT_SUBGHZ_CARRIER_DB) {
@@ -397,11 +452,17 @@ static void sampleBand(uint8_t si, uint32_t nowMs) {
 }
 
 void subghzService(uint32_t nowMs) {
-  if (!gOk || !gEnabled) return;
+  if (!gOk || !gEnabled || !gRadio) return;
 
   if (gHopping) {
-    if (nowMs - gBandEnterMs >= ROOT_SUBGHZ_DWELL_MS) {
+    const uint16_t dwell = SLOTS[gSlotIdx].dwellMs ? SLOTS[gSlotIdx].dwellMs
+                                                   : (uint16_t)ROOT_SUBGHZ_DWELL_MS;
+    if (nowMs - gBandEnterMs >= dwell) {
       gSlotIdx = (gSlotIdx + 1) % SLOT_N;
+      gCal[gSlotIdx].inBurst = false;
+      gCal[gSlotIdx].emittedThisBurst = false;
+      gCal[gSlotIdx].eventPeak = -120;
+      gCal[gSlotIdx].hotSamples = 0;
       configureSlot(SLOTS[gSlotIdx]);
       gBandEnterMs = nowMs;
     }
@@ -460,7 +521,7 @@ bool subghzPopActivity(SubGhzHit* out) {
 void subghzStatusJson(char* out, size_t n) {
   if (!out || n < 8) return;
   snprintf(out, n,
-           "{\"ready\":true,\"enabled\":%s,\"scan\":\"315,433,868,915\","
+           "{\"ready\":true,\"enabled\":%s,\"scan\":\"315,433,868\","
            "\"hopping\":%s,\"band\":\"%s\",\"freq_mhz\":%.2f,\"ook\":%s,"
            "\"rssi\":%d,\"noise_dbm\":%.1f,\"bursts\":%lu,\"raw\":%lu,"
            "\"burst_thresh_db\":%d,\"carrier_thresh_db\":%d}",
@@ -604,7 +665,7 @@ bool subghzRawCommand(const char* args, char* out, size_t n) {
     }
   };
   auto apf = [&](const char* fmt, ...) {
-    char buf[384];
+    char buf[768];
     va_list a;
     va_start(a, fmt);
     vsnprintf(buf, sizeof buf, fmt, a);
@@ -618,49 +679,91 @@ bool subghzRawCommand(const char* args, char* out, size_t n) {
   auto dumpList = [&](uint32_t want, float filterMhz, bool withGps) {
     uint32_t shown = 0;
     if (filterMhz > 0)
-      apf("=== SUB-GHZ RAW PACKETS (%.2f MHz, last %lu) ===\n\n", filterMhz, (unsigned long)want);
+      apf("=== SUB-GHZ RAW (%.2f MHz, last %lu) ===\n\n", filterMhz, (unsigned long)want);
     else
-      apf("=== SUB-GHZ RAW PACKETS (last %lu) ===\n\n", (unsigned long)want);
+      apf("=== SUB-GHZ RAW (last %lu) ===\n\n", (unsigned long)want);
     for (uint32_t i = 0; i < gRawCount && shown < want; i++) {
       SubGhzRawPacket pk;
       if (!subghzRawGet(i, &pk)) break;
       if (filterMhz > 0 && fabsf(pk.frequencyMhz - filterMhz) > 2.0f) continue;
       shown++;
-      char hex[400], asc[140], tbuf[32];
-      hexAscii(pk.data, pk.length, hex, sizeof hex, asc, sizeof asc);
+      // Compact Omni-friendly lines (full hex capped so HTTP/Omni never blanks)
+      const uint8_t showB = pk.length > 24 ? 24 : pk.length;
+      char hex[96];
+      size_t hi = 0;
+      for (uint8_t b = 0; b < showB && hi + 4 < sizeof hex; b++) {
+        hi += (size_t)snprintf(hex + hi, sizeof hex - hi, "%02X%s", pk.data[b],
+                               b + 1 < showB ? " " : "");
+      }
+      if (pk.length > showB && hi + 4 < sizeof hex) {
+        hi += (size_t)snprintf(hex + hi, sizeof hex - hi, " …");
+      }
+      hex[hi] = 0;
+      char tbuf[32];
       fmtTime(pk.timestampMs, tbuf, sizeof tbuf);
       if (withGps && pk.gpsValid) {
-        apf("[%lu] %.2f MHz %d dBm %u bytes %.7f, %.7f\nHEX: %s\nASCII: %s\nTime: %s\n\n",
+        apf("[%lu] %.2f MHz %d dBm %uB @ %.5f,%.5f\nHEX: %s\nTime: %s\n\n",
             (unsigned long)shown, pk.frequencyMhz, (int)pk.rssi, (unsigned)pk.length,
-            pk.lat, pk.lon, hex, asc, tbuf);
+            pk.lat, pk.lon, hex, tbuf);
       } else {
-        apf("[%lu] %.2f MHz %d dBm %u bytes\nHEX: %s\nASCII: %s\nTime: %s\n\n",
+        apf("[%lu] %.2f MHz %d dBm %uB\nHEX: %s\nTime: %s\n\n",
             (unsigned long)shown, pk.frequencyMhz, (int)pk.rssi, (unsigned)pk.length,
-            hex, asc, tbuf);
+            hex, tbuf);
       }
     }
-    if (!shown) ap("(no packets yet)\n");
+    if (!shown) {
+      ap("(no raw captures yet)\n");
+      ap("Press a 315/433/868 remote near the board, then run again.\n");
+      ap("Also try: GET http://192.168.4.1/api/subghz/raw?n=20\n");
+    }
     return shown;
   };
 
   if (!*p) {
     uint32_t show = gRawCount < 10 ? gRawCount : 10;
-    dumpList(show ? show : 10, 0, true);
+    if (!show) {
+      // Always print live RF status so Omni tab is never empty white noise
+      char st[220];
+      subghzStatusJson(st, sizeof st);
+      ap("=== SUB-GHZ RAW ===\n(no packets in ring yet)\n");
+      apf("Status: %s\n", st);
+      ap("Tip: mash a key fob on 315/433 while this band is dwelling,\n"
+         "then ./omni subghz raw again — or open /api/subghz/raw?n=20\n");
+      return true;
+    }
+    dumpList(show, 0, true);
     float mb = subghzRawBytesUsed() / (1024.0f * 1024.0f);
-    apf("--- SUMMARY ---\nTotal Raw Packets: %lu\nLast %lu: Shown above\nBuffer: %u packets (%.2fMB used)\n",
-        (unsigned long)gRawTotal, (unsigned long)(gRawCount < 10 ? gRawCount : 10),
-        (unsigned)gRawCap, mb);
+    apf("--- SUMMARY ---\nTotal Raw Packets: %lu\nShown: %lu\nBuffer: %u slots (%.2fMB)\n",
+        (unsigned long)gRawTotal, (unsigned long)show, (unsigned)gRawCap, mb);
     return true;
   }
 
   if (strncasecmp(p, "last", 4) == 0) {
     SubGhzRawPacket pk;
     if (!subghzRawGet(0, &pk)) {
+      char st[220];
+      subghzStatusJson(st, sizeof st);
       ap("ERROR: No raw packets captured\n");
+      apf("Status: %s\n", st);
       return false;
     }
-    char hex[400], asc[140], tbuf[32];
-    hexAscii(pk.data, pk.length, hex, sizeof hex, asc, sizeof asc);
+    const uint8_t showB = pk.length > 48 ? 48 : pk.length;
+    char hex[200];
+    size_t hi = 0;
+    for (uint8_t b = 0; b < showB && hi + 4 < sizeof hex; b++) {
+      hi += (size_t)snprintf(hex + hi, sizeof hex - hi, "%02X%s", pk.data[b],
+                             b + 1 < showB ? " " : "");
+    }
+    if (pk.length > showB && hi + 4 < sizeof hex)
+      hi += (size_t)snprintf(hex + hi, sizeof hex - hi, " …");
+    hex[hi] = 0;
+    char asc[64], tbuf[32];
+    size_t ai = 0;
+    for (uint8_t i = 0; i < showB && ai + 1 < sizeof asc; i++) {
+      char c = (pk.data[i] >= 32 && pk.data[i] < 127) ? (char)pk.data[i] : '.';
+      asc[ai++] = c;
+    }
+    asc[ai] = 0;
     fmtTime(pk.timestampMs, tbuf, sizeof tbuf);
     ap("=== LAST SUB-GHZ PACKET ===\n");
     apf("Frequency: %.2f MHz\nRSSI: %d dBm\nLength: %u bytes\n",

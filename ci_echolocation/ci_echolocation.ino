@@ -80,7 +80,7 @@ struct SniffHit {
   char ssid[33];
   char band[12];
   char vendor[24];
-  char encrypt[16];
+  char encrypt[48];  // Wi-Fi enc / Sub-GHz hex preview
 };
 
 struct Device {
@@ -109,7 +109,7 @@ struct Device {
   char ssid[33];
   char band[12];
   char vendor[24];
-  char encrypt[16];
+  char encrypt[48];  // Wi-Fi enc / Sub-GHz hex preview
   bool inUse;
 };
 
@@ -139,6 +139,11 @@ static AsyncWebServer gServer(80);
 static DNSServer gDns;
 static char* gJson = nullptr;
 static size_t gJsonCap = 0;
+// Last ./omni log save — lives in PSRAM until reboot; download via GET /api/export
+static char* gExportBlob = nullptr;
+static size_t gExportLen = 0;
+static char gExportPath[80] = "";
+static uint32_t gExportEntries = 0;
 
 // —— OmniScan state ——
 static bool gOmniRunning = true;
@@ -592,8 +597,8 @@ static void ingestSubGhz(const SubGhzHit& sg) {
 static void serviceSubGhz(uint32_t nowMs) {
   subghzService(nowMs);
   SubGhzHit sg;
+  // Real energy / packet hits only — never invent device rows from band-monitor RSSI.
   while (subghzPopHit(&sg)) ingestSubGhz(sg);
-  if (subghzPopActivity(&sg)) ingestSubGhz(sg);
 }
 
 static void ingestLora(const LoraHit& lh) {
@@ -843,10 +848,7 @@ static bool softApAlive();
 static void serviceSoftAp(uint32_t now);
 
 static void lockApChannel() {
-  if (gChannel == AP_CHANNEL) return;
-  if (esp_wifi_set_channel(AP_CHANNEL, WIFI_SECOND_CHAN_NONE) == ESP_OK) {
-    gChannel = AP_CHANNEL;
-  }
+  // SoftAP no longer pins the radio to ch1 — hopping owns the channel.
 }
 
 // —— OmniScan hooks ——
@@ -893,9 +895,15 @@ static OmniSnapshot omniSnap() {
   if (!s.lrPeer[0] && gLrPeer[0]) strncpy(s.lrPeer, gLrPeer, sizeof s.lrPeer - 1);
   s.sdMounted = false;
   s.sdFreeGb = 0;
-  snprintf(s.logPath, sizeof s.logPath, "psram://session");
-  s.logEntries = s.wifiDevices;
-  s.logSizeMb = 0;
+  if (gExportPath[0]) {
+    snprintf(s.logPath, sizeof s.logPath, "%s", gExportPath);
+    s.logEntries = gExportEntries;
+    s.logSizeMb = gExportLen / (1024.0f * 1024.0f);
+  } else {
+    snprintf(s.logPath, sizeof s.logPath, "psram://(unsaved — use ./omni log save)");
+    s.logEntries = s.wifiDevices;
+    s.logSizeMb = 0;
+  }
   s.freeHeap = ESP.getFreeHeap();
   s.freePsram = ESP.getFreePsram();
   s.psramSize = ESP.getPsramSize();
@@ -987,13 +995,81 @@ static bool omniLrTest(char* out, size_t n) {
   return wifiLrTest(out, n);
 }
 static bool omniLogSave(char* pathOut, size_t n) {
-  snprintf(pathOut, n, "psram://omniscan_%lu.json", (unsigned long)millis());
+  if (xSemaphoreTake(gJsonMux, pdMS_TO_TICKS(3000)) != pdTRUE) {
+    if (pathOut && n) pathOut[0] = 0;
+    return false;
+  }
+  const size_t len = buildJson();
+  if (!gJson || len == 0) {
+    xSemaphoreGive(gJsonMux);
+    if (pathOut && n) pathOut[0] = 0;
+    return false;
+  }
+  char* copy = (char*)heap_caps_malloc(len + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!copy) copy = (char*)malloc(len + 1);
+  if (!copy) {
+    xSemaphoreGive(gJsonMux);
+    if (pathOut && n) pathOut[0] = 0;
+    return false;
+  }
+  memcpy(copy, gJson, len);
+  copy[len] = 0;
+  xSemaphoreGive(gJsonMux);
+
+  if (gExportBlob) {
+    free(gExportBlob);
+    gExportBlob = nullptr;
+  }
+  gExportBlob = copy;
+  gExportLen = len;
+  gExportEntries = gDev ? (uint32_t)gDev->size() : 0;
+  snprintf(gExportPath, sizeof gExportPath, "psram://omniscan_%lu.json",
+           (unsigned long)millis());
+  if (pathOut && n) {
+    snprintf(pathOut, n, "%s", gExportPath);
+  }
+  Serial.printf("root: session saved %u bytes → %s (GET http://192.168.4.1/api/export)\n",
+                (unsigned)gExportLen, gExportPath);
   return true;
 }
 static bool omniLogDump(char* out, size_t n) {
+  if (!out || n < 64) return false;
+  if (!gExportBlob || !gExportLen) {
+    // Live dump into response (may truncate)
+    if (xSemaphoreTake(gJsonMux, pdMS_TO_TICKS(2000)) != pdTRUE) {
+      snprintf(out, n, "ERROR: busy\n");
+      return false;
+    }
+    size_t len = buildJson();
+    size_t u = 0;
+    auto ap = [&](const char* s) {
+      size_t l = strlen(s);
+      if (u + l + 1 < n) {
+        memcpy(out + u, s, l);
+        u += l;
+        out[u] = 0;
+      }
+    };
+    ap("Dumping live session (not yet saved)...\n");
+    if (gJson && len) {
+      size_t take = len;
+      if (u + take + 16 >= n) take = n > u + 16 ? n - u - 16 : 0;
+      if (take) {
+        memcpy(out + u, gJson, take);
+        u += take;
+        out[u] = 0;
+      }
+      if (take < len) ap("\n…truncated\n");
+    }
+    ap("\nDone. Tip: ./omni log save then GET /api/export\n");
+    xSemaphoreGive(gJsonMux);
+    return true;
+  }
   snprintf(out, n,
-           "Dumping log...\n{\"exported_at_ms\":%lu,\"name\":\"root\",\"devices\":%u}\nDone.\n",
-           (unsigned long)millis(), gDev ? (unsigned)gDev->size() : 0u);
+           "Dumping saved log...\nFile: %s\nSize: %u bytes\nEntries: %lu\n"
+           "Download: http://192.168.4.1/api/export\n"
+           "(payload too large for Serial — use /api/export)\nDone.\n",
+           gExportPath, (unsigned)gExportLen, (unsigned long)gExportEntries);
   return true;
 }
 static bool omniSysReset() {
@@ -1109,68 +1185,93 @@ static void omniSetupHooks() {
   omniInit(&hooks);
 }
 
-static char gOmniOut[6144];
+static char* gOmniOut = nullptr;
+static size_t gOmniOutCap = 0;
+
+static char* omniOutBuf() {
+  if (!gOmniOut) {
+    gOmniOutCap = 24576;
+    gOmniOut = (char*)heap_caps_malloc(gOmniOutCap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!gOmniOut) {
+      gOmniOutCap = 8192;
+      gOmniOut = (char*)malloc(gOmniOutCap);
+    }
+  }
+  return gOmniOut;
+}
 
 static void omniRespondHttp(AsyncWebServerRequest* req, const char* cmd) {
-  const bool ok = omniHandle(cmd, gOmniOut, sizeof gOmniOut);
-  // JSON-escape output roughly
-  size_t need = strlen(gOmniOut) * 2 + 128;
-  char* body = (char*)malloc(need);
-  if (!body) {
+  char* out = omniOutBuf();
+  if (!out) {
     req->send(500, "application/json", "{\"ok\":false,\"error\":\"oom\"}");
     return;
   }
-  size_t o = 0;
-  o += (size_t)snprintf(body + o, need - o, "{\"ok\":%s,\"status\":\"%s\",\"output\":\"",
-                        ok ? "true" : "false", ok ? "OK" : "ERROR");
-  for (const char* p = gOmniOut; *p && o + 8 < need; p++) {
+  out[0] = 0;
+  const bool ok = omniHandle(cmd, out, gOmniOutCap);
+  // Build JSON in a String so AsyncWebServer owns a stable copy (never free-before-send).
+  String body;
+  body.reserve(strlen(out) + 64);
+  body += "{\"ok\":";
+  body += ok ? "true" : "false";
+  body += ",\"status\":\"";
+  body += ok ? "OK" : "ERROR";
+  body += "\",\"output\":\"";
+  for (const char* p = out; *p; p++) {
     char c = *p;
     if (c == '"' || c == '\\') {
-      body[o++] = '\\';
-      body[o++] = c;
+      body += '\\';
+      body += c;
     } else if (c == '\n') {
-      body[o++] = '\\';
-      body[o++] = 'n';
+      body += "\\n";
     } else if (c == '\r') {
       continue;
     } else if ((uint8_t)c < 32) {
       continue;
     } else {
-      body[o++] = c;
+      body += c;
     }
   }
-  o += (size_t)snprintf(body + o, need - o, "\"}");
+  body += "\"}";
   req->send(200, "application/json", body);
-  free(body);
 }
 
 
+static bool applyWifiChannel(uint8_t ch) {
+  if (ch < ROOT_WIFI_CH_MIN || ch > ROOT_WIFI_CH_MAX) return false;
+  // SoftAP + promiscuous share one PHY — set_channel moves both.
+  const esp_err_t err = esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+  if (err != ESP_OK) {
+    Serial.printf("root: wifi set_channel(%u) failed (%d)\n", (unsigned)ch, (int)err);
+    return false;
+  }
+  gChannel = ch;
+  return true;
+}
+
 static void serviceHop() {
   if (!gHopEnable) return;
-  // Never move the SoftAP while a phone/laptop is joined — hopping kills the link.
-  if (WiFi.softAPgetStationNum() > 0) {
-    lockApChannel();
-    return;
-  }
   const uint32_t now = millis();
-  const uint32_t dwell =
-      (gChannel == AP_CHANNEL) ? ROOT_HOP_HOME_DWELL_MS : ROOT_HOP_AWAY_DWELL_MS;
-  if (now - gLastHopMs < dwell) return;
+  if (now - gLastHopMs < (uint32_t)ROOT_HOP_DWELL_MS) return;
   gLastHopMs = now;
 
-  uint8_t next = gChannel + 1;
-  if (next < 1 || next > 13) next = 1;
-  if (esp_wifi_set_channel(next, WIFI_SECOND_CHAN_NONE) == ESP_OK) {
-    gChannel = next;
+  uint8_t next = (uint8_t)(gChannel + 1);
+  if (next < ROOT_WIFI_CH_MIN || next > ROOT_WIFI_CH_MAX) next = ROOT_WIFI_CH_MIN;
+  if (!applyWifiChannel(next)) return;
+
+  static uint32_t lastHopLogMs = 0;
+  if (now - lastHopLogMs >= 2000) {
+    lastHopLogMs = now;
+    Serial.printf("root: wifi hop → ch %u (scan %u–%u)\n",
+                  (unsigned)gChannel, (unsigned)ROOT_WIFI_CH_MIN,
+                  (unsigned)ROOT_WIFI_CH_MAX);
   }
 }
 
 static void setChannelManual(uint8_t ch, bool hop) {
   gHopEnable = hop;
-  if (ch < 1 || ch > 13) ch = AP_CHANNEL;
-  if (esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE) == ESP_OK) {
-    gChannel = ch;
-  }
+  if (ch < ROOT_WIFI_CH_MIN || ch > ROOT_WIFI_CH_MAX) ch = AP_CHANNEL;
+  applyWifiChannel(ch);
+  gLastHopMs = millis();
 }
 
 static void serviceLed() {
@@ -1300,19 +1401,26 @@ static bool bringUpSoftAp() {
 }
 
 static void armPromiscuous() {
-  esp_wifi_set_channel(AP_CHANNEL, WIFI_SECOND_CHAN_NONE);
   wifi_promiscuous_filter_t filter = {};
   filter.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA;
   esp_wifi_set_promiscuous_filter(&filter);
   esp_wifi_set_promiscuous_rx_cb(&snifferCb);
   esp_wifi_set_promiscuous(true);
-  esp_wifi_set_channel(AP_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  gHopEnable = true;
+  gLastHopMs = 0;  // hop on next serviceHop()
+  if (gChannel < ROOT_WIFI_CH_MIN || gChannel > ROOT_WIFI_CH_MAX) {
+    applyWifiChannel(ROOT_WIFI_CH_MIN);
+  }
+  Serial.printf("root: Wi-Fi sniffer ON · hopping ch %u–%u every %ums (now ch %u)\n",
+                (unsigned)ROOT_WIFI_CH_MIN, (unsigned)ROOT_WIFI_CH_MAX,
+                (unsigned)ROOT_HOP_DWELL_MS, (unsigned)gChannel);
 }
 
 static void startRadio() {
   const bool ok = bringUpSoftAp();
   gChannel = AP_CHANNEL;
-  gHopEnable = false;
+  gHopEnable = true;  // start 1–11 hop immediately; sniffer joins when armed
+  gLastHopMs = millis();
   gSoftApUp = ok;
 
   WiFi.macAddress(gSelfMac);
@@ -1368,7 +1476,7 @@ static void serviceSoftAp(uint32_t now) {
     gBleDeferred = false;
     armBleAfterSoftAp();
   }
-  if (gPromiscDeferred && now >= 12000) {
+  if (gPromiscDeferred && now >= 5000) {
     gPromiscDeferred = false;
     armPromiscuous();
     wifiLrInit();
@@ -1383,6 +1491,7 @@ static void serviceSoftAp(uint32_t now) {
   Serial.println("root: SoftAP down — restarting");
   bringUpSoftAp();
   WiFi.softAPmacAddress(gApMac);
+  gHopEnable = true;
   if (!gPromiscDeferred) armPromiscuous();
 }
 
@@ -1542,13 +1651,88 @@ static void startWeb() {
         gHopEnable = true;
       } else {
         const int ch = v.toInt();
-        if (ch >= 1 && ch <= 13) setChannelManual((uint8_t)ch, false);
+        if (ch >= ROOT_WIFI_CH_MIN && ch <= ROOT_WIFI_CH_MAX)
+          setChannelManual((uint8_t)ch, false);
       }
     }
     char buf[96];
     snprintf(buf, sizeof(buf), "{\"channel\":%u,\"hopping\":%s}",
              (unsigned)gChannel, gHopEnable ? "true" : "false");
     req->send(200, "application/json", buf);
+  });
+
+  // Last ./omni log save (PSRAM). If none saved yet, builds a live snapshot.
+  gServer.on("/api/export", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (gExportBlob && gExportLen) {
+      AsyncWebServerResponse* r =
+          req->beginResponse(200, "application/json", (uint8_t*)gExportBlob, gExportLen);
+      char disp[96];
+      const char* name = gExportPath[0] ? strrchr(gExportPath, '/') : nullptr;
+      snprintf(disp, sizeof disp, "attachment; filename=\"%s\"",
+               name && name[1] ? name + 1 : "omniscan.json");
+      r->addHeader("Content-Disposition", disp);
+      r->addHeader("X-Root-Path", gExportPath);
+      req->send(r);
+      return;
+    }
+    if (xSemaphoreTake(gJsonMux, pdMS_TO_TICKS(3000)) != pdTRUE) {
+      req->send(503, "application/json", "{\"ok\":false,\"error\":\"busy\"}");
+      return;
+    }
+    size_t len = buildJson();
+    if (!gJson || !len) {
+      xSemaphoreGive(gJsonMux);
+      req->send(500, "application/json", "{\"ok\":false,\"error\":\"empty\"}");
+      return;
+    }
+    String body;
+    body.reserve(len + 8);
+    body.concat(gJson, len);
+    xSemaphoreGive(gJsonMux);
+    AsyncWebServerResponse* r = req->beginResponse(200, "application/json", body);
+    r->addHeader("Content-Disposition", "attachment; filename=\"omniscan-live.json\"");
+    req->send(r);
+  });
+
+  // Recent Sub-GHz raw captures with HEX (bursts + packets)
+  gServer.on("/api/subghz/raw", HTTP_GET, [](AsyncWebServerRequest* req) {
+    uint32_t want = 20;
+    if (req->hasParam("n")) {
+      int v = req->getParam("n")->value().toInt();
+      if (v >= 1 && v <= 50) want = (uint32_t)v;
+    }
+    const uint32_t have = subghzRawCount();
+    if (want > have) want = have;
+    String body;
+    body.reserve(256 + want * 200);
+    body += "{\"ok\":true,\"total\":";
+    body += String((unsigned long)subghzRawTotal());
+    body += ",\"count\":";
+    body += String((unsigned)want);
+    body += ",\"packets\":[";
+    for (uint32_t i = 0; i < want; i++) {
+      SubGhzRawPacket pk;
+      if (!subghzRawGet(i, &pk)) break;
+      if (i) body += ',';
+      body += "{\"ts_ms\":";
+      body += String((unsigned long)pk.timestampMs);
+      body += ",\"mhz\":";
+      body += String(pk.frequencyMhz, 2);
+      body += ",\"rssi\":";
+      body += String((int)pk.rssi);
+      body += ",\"len\":";
+      body += String((unsigned)pk.length);
+      body += ",\"hex\":\"";
+      char hx[4];
+      for (uint8_t b = 0; b < pk.length; b++) {
+        snprintf(hx, sizeof hx, "%02X", pk.data[b]);
+        body += hx;
+        if (b + 1 < pk.length) body += ' ';
+      }
+      body += "\"}";
+    }
+    body += "]}";
+    req->send(200, "application/json", body);
   });
 
   gServer.on("/api/omni", HTTP_GET, [](AsyncWebServerRequest* req) {
@@ -1620,6 +1804,7 @@ void setup() {
   strncpy(gApSsidBuf, ROOT_AP_SSID, sizeof gApSsidBuf - 1);
   omniSetupHooks();
   Serial.println("root: OmniScan ./omni commands ready (Serial + /api/omni)");
+  Serial.println("root: GET /api/export · GET /api/subghz/raw?n=20");
 
   sightInit();
   gDev = new DevMap();
@@ -1661,8 +1846,10 @@ static void serviceSerialCmds() {
           strcmp(line, "s") == 0 || strcmp(line, "h") == 0 || strcmp(line, "d") == 0 ||
           strncmp(line, "ch ", 3) == 0 || strcmp(line, "start") == 0 ||
           strcmp(line, "stop") == 0) {
-        omniHandle(line, gOmniOut, sizeof gOmniOut);
-        Serial.print(gOmniOut);
+        char* out = omniOutBuf();
+        if (!out) continue;
+        omniHandle(line, out, gOmniOutCap);
+        Serial.print(out);
         continue;
       }
       if (strcmp(line, "status") == 0) {
@@ -1679,11 +1866,11 @@ static void serviceSerialCmds() {
           Serial.println("root: hop auto");
         } else {
           const int ch = atoi(arg);
-          if (ch >= 1 && ch <= 13) {
+          if (ch >= ROOT_WIFI_CH_MIN && ch <= ROOT_WIFI_CH_MAX) {
             setChannelManual((uint8_t)ch, false);
             Serial.printf("root: hop %d\n", ch);
           } else {
-            Serial.println("root: hop needs 1-13 or auto");
+            Serial.println("root: hop needs 1-11 or auto");
           }
         }
       } else if (strcmp(line, "rf") == 0) {
@@ -1692,16 +1879,21 @@ static void serviceSerialCmds() {
         loraStatusJson(lo, sizeof lo);
         Serial.printf("root rf: {\"subghz\":%s,\"lora\":%s}\n", sg, lo);
       } else if (strcmp(line, "help") == 0) {
-        Serial.println("root cmds: status | rf | hop auto | hop <1-13> | ./omni …");
-        omniHandle("./omni system help", gOmniOut, sizeof gOmniOut);
-        Serial.print(gOmniOut);
+        Serial.println("root cmds: status | rf | hop auto | hop <1-11> | ./omni …");
+        char* out = omniOutBuf();
+        if (out) {
+          omniHandle("./omni system help", out, gOmniOutCap);
+          Serial.print(out);
+        }
       } else {
         // Try as omni shorthand
-        omniHandle(line, gOmniOut, sizeof gOmniOut);
-        if (strstr(gOmniOut, "Unknown command")) {
+        char* out = omniOutBuf();
+        if (!out) continue;
+        omniHandle(line, out, gOmniOutCap);
+        if (strstr(out, "Unknown command")) {
           Serial.println("root: unknown — try help or ./omni system help");
         } else {
-          Serial.print(gOmniOut);
+          Serial.print(out);
         }
       }
       continue;
