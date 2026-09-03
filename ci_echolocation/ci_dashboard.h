@@ -148,6 +148,9 @@ body{
 .radar-disclaimer b{color:var(--accent);font-weight:600}
 
 .list-toolbar{flex-shrink:0;padding:var(--s3);border-bottom:1px solid var(--line);display:flex;flex-direction:column;gap:var(--s3);background:rgba(255,255,255,.015)}
+.list-toolbar-row{display:flex;gap:var(--s2);align-items:stretch}
+.list-toolbar-row .search-wrap{flex:1;min-width:0}
+.list-toolbar-row .btn{flex-shrink:0;white-space:nowrap}
 @media(max-width:720px){
   .list-toolbar{padding:var(--s2) var(--s3);gap:var(--s2)}
   .lists-box:not([open]){padding:0;border:0}
@@ -444,15 +447,13 @@ body{
   <div class="band-pills" id="bandPills"></div>
   <div class="status-count" id="count">0/0</div>
   <div class="toolbar-actions">
-    <button type="button" class="btn primary" id="btnCopyVisible" title="Copy visible devices">Copy</button>
-    <button type="button" class="btn" id="btnCopyJson" title="Copy visible as JSON">JSON</button>
+    <button type="button" class="btn primary" id="btnExportDevices" title="Download full device roster (JSON + CSV)">Export</button>
+    <button type="button" class="btn" id="btnCopyVisible" title="Copy filtered/search results to clipboard">Copy</button>
+    <button type="button" class="btn" id="btnCopyJson" title="Copy filtered/search results as JSON">JSON</button>
     <button type="button" class="btn" id="btnPause">Pause</button>
     <button type="button" class="btn" id="btnClear">Clear</button>
     <button type="button" class="btn icon" id="btnShot" title="Screenshot radar">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
-    </button>
-    <button type="button" class="btn icon" id="btnExport" title="Export session JSON">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
     </button>
   </div>
 </header>
@@ -483,8 +484,11 @@ body{
 
   <section class="panel" id="panelList">
     <div class="list-toolbar">
-      <div class="search-wrap">
-        <input class="search" id="search" type="search" enterkeyhint="search" placeholder="Search MAC, SSID, band…" autocomplete="off"/>
+      <div class="list-toolbar-row">
+        <div class="search-wrap">
+          <input class="search" id="search" type="search" enterkeyhint="search" placeholder="Search MAC, SSID, band…" autocomplete="off"/>
+        </div>
+        <button type="button" class="btn primary" id="btnExportDevicesList" title="Download full device roster (JSON + CSV)">Export devices</button>
       </div>
       <div class="filters-wrap">
         <div class="filters" id="filters">
@@ -558,7 +562,7 @@ const CLIENT_HOLD_MS=600000;
 const LIVE_MS=60000;
 let rfMeta={subghz:null,lora:null};
 let radarW=300,radarH=300,dpr=1,paused=false,frozenSweep=0,pollTimer=null;
-let scanMeta={channel:null,hopping:null,uptime_ms:0,session_ms:0,name:"root"};
+let scanMeta={channel:null,hopping:null,uptime_ms:0,session_ms:0,name:"root",scanner_gps:null};
 let whitelist=[],blacklist=[];
 let selectedMac=null,blipAnim={},hitList=[];
 
@@ -826,8 +830,8 @@ function kindExplain(k){
 function bandExplain(b){
   const m={
     wifi:"2.4 GHz Wi-Fi (passive promiscuous). Listen-only — no transmit.",
-    subghz:"CC1101 scanner: 315 / 433 / 868 / 915 MHz bursts and carriers.",
-    lora:"E22 LoRa UART at 915 MHz. Needs real LoRa traffic nearby."
+    subghz:"CC1101: 315/433 OOK+FSK and 868/915 FSK — bursts, carriers, packets.",
+    lora:"E22 transparent UART @ 915 MHz — real payloads only (noise filtered)."
   };
   return m[b]||"RF band this hit was sorted into.";
 }
@@ -870,8 +874,16 @@ function renderDeviceFields(d){
   html+=kvRow("Type",kind);
   if(d.ssid&&d.ssid.trim()) html+=kvRow("SSID / label",d.ssid.replace(/</g,"&lt;"));
   if(d.bssid&&d.bssid.trim()) html+=kvRow("BSSID",d.bssid);
-  if(d.encrypt) html+=kvRow("Encrypt",String(d.encrypt).replace(/</g,"&lt;"));
-  if(d.ch) html+=kvRow("Channel","ch"+d.ch);
+  if(d.encrypt){
+    const encLabel=(d.band==="subghz"||d.band==="lora")?"Detail":"Encrypt";
+    html+=kvRow(encLabel,String(d.encrypt).replace(/</g,"&lt;"));
+  }
+  if(d.ch){
+    const SG={1:315,2:433,3:868,4:915};
+    if(d.band==="subghz"&&SG[d.ch]) html+=kvRow("Frequency",SG[d.ch]+" MHz");
+    else if(d.band==="lora") html+=kvRow("Frequency","915 MHz");
+    else html+=kvRow("Channel","ch"+d.ch);
+  }
   html+=kvRow("RSSI",rssi);
   html+=kvRow("Distance","~"+dist+" m");
   html+=kvRow("Zone",z);
@@ -899,6 +911,8 @@ function renderDeviceCard(d,opts){
     '<span class="tag">'+rssi+'</span>'+
     '<span class="tag">'+z+'</span>'+
     (d.vendor?'<span class="tag">'+String(d.vendor).replace(/</g,"&lt;")+'</span>':"")+
+    ((()=>{const SG={1:315,2:433,3:868,4:915}; if(d.band==="lora") return '<span class="tag">915 MHz</span>'; if(d.band==="subghz"&&SG[d.ch]) return '<span class="tag">'+SG[d.ch]+' MHz</span>'; return "";})())+
+    (d.encrypt&&(d.band==="subghz"||d.band==="lora")?'<span class="tag ssid">'+String(d.encrypt).replace(/</g,"&lt;")+'</span>':"")+
     (d.seen_count?'<span class="tag">'+(d.seen_count||1)+' pkts</span>':"")+
     (d.ssid&&d.ssid.trim()?'<span class="tag ssid">'+d.ssid.replace(/</g,"&lt;")+'</span>':"");
   return '<div class="dev-card'+tcl+sel+bandCls+'" data-mac="'+macEsc+'">'+
@@ -1175,7 +1189,33 @@ function downloadBlob(blob,name){
   document.body.appendChild(a);a.click();a.remove();
   setTimeout(()=>URL.revokeObjectURL(a.href),3000);
 }
-function exportScanJson(){
+function csvEscape(v){
+  const s=v==null?"":String(v);
+  if(/[",\n\r]/.test(s)) return '"'+s.replace(/"/g,'""')+'"';
+  return s;
+}
+function deviceExportRow(d){
+  const o={...d}; delete o._feedMs;
+  return o;
+}
+function exportDevicesCsv(rows){
+  const cols=["mac","name","band","kind","ssid","bssid","vendor","encrypt","ch","rssi","avg","distance_m","zone","seen_count","last_seen_ms","pkt_rate","lat","lon","wifi_lr","ble"];
+  const lines=[cols.join(",")];
+  for(const d of rows){
+    const name=plainName(d);
+    const rssi=d.avg!=null?d.avg:d.rssi;
+    lines.push([
+      d.mac,name,d.band,d.kind,d.ssid,d.bssid,d.vendor,d.encrypt,d.ch,
+      rssi,d.avg,d.distance_m,d.zone,d.seen_count,d.last_seen_ms,d.pkt_rate,
+      d.lat,d.lon,d.wifi_lr,d.ble
+    ].map(csvEscape).join(","));
+  }
+  return lines.join("\n")+"\n";
+}
+/** Full device roster file download — ignores search/filters (Copy/JSON are clipboard dumps of visible rows). */
+function exportDevices(){
+  const rows=sorted(listDevices()).map(deviceExportRow);
+  const ts=new Date().toISOString().replace(/[:.]/g,"-");
   const payload={
     exported_at:new Date().toISOString(),
     name:scanMeta.name||"root",
@@ -1184,13 +1224,14 @@ function exportScanJson(){
     hopping:scanMeta.hopping,
     uptime_ms:scanMeta.uptime_ms,
     session_ms:scanMeta.session_ms,
-    count:allDevices.length,
-    filters:{search:searchQ,active:[...activeFilters]},
+    count:rows.length,
     whitelist,blacklist,
-    devices:allDevices
+    scanner_gps:scanMeta.scanner_gps||null,
+    devices:rows
   };
-  const ts=new Date().toISOString().replace(/[:.]/g,"-");
-  downloadBlob(new Blob([JSON.stringify(payload,null,2)],{type:"application/json"}),"root-scan-"+ts+".json");
+  downloadBlob(new Blob([JSON.stringify(payload,null,2)],{type:"application/json"}),"root-devices-"+ts+".json");
+  downloadBlob(new Blob([exportDevicesCsv(rows)],{type:"text/csv;charset=utf-8"}),"root-devices-"+ts+".csv");
+  toast(rows.length+" device"+(rows.length===1?"":"s")+" exported");
 }
 function screenshotRadar(){
   try{
@@ -1237,7 +1278,8 @@ document.getElementById("btnClear").onclick=()=>{if(confirm("Clear session devic
 document.getElementById("btnCopyVisible").onclick=copyVisibleText;
 document.getElementById("btnCopyJson").onclick=copyVisibleJson;
 document.getElementById("btnShot").onclick=screenshotRadar;
-document.getElementById("btnExport").onclick=exportScanJson;
+document.getElementById("btnExportDevices").onclick=exportDevices;
+document.getElementById("btnExportDevicesList").onclick=exportDevices;
 function fitRadar(){
   const panel=document.getElementById("panelRadar");
   if(!radarStage||!panel.classList.contains("on")) return;
@@ -1646,6 +1688,7 @@ async function poll(){
     scanMeta.uptime_ms=data.uptime_ms||0;
     scanMeta.session_ms=data.session_ms||data.uptime_ms||0;
     scanMeta.name=data.name||"root";
+    scanMeta.scanner_gps=data.scanner_gps||null;
     scanMeta.total=listDevices().length;
     updateCountBadge();
     pollRf().then(()=>{

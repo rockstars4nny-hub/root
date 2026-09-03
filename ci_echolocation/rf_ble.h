@@ -30,4 +30,6 @@ void bleService(uint32_t nowMs);
 bool blePopHit(BleHit* out);
 uint32_t bleTrackedCount();
 void bleGetMacStr(char* out, size_t n);
+bool bleGetMac(uint8_t out[6]);
+bool bleIsSelfMac(const uint8_t* mac);
 bool bleListText(char* out, size_t n, const char* nameFilter);

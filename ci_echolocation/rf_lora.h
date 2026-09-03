@@ -5,7 +5,10 @@
 struct LoraHit {
   int8_t rssi;
   uint8_t mac[6];
-  char label[33];
+  char label[40];
+  char detail[48];  // hex preview
+  uint16_t len;
+  bool activity;    // true = status-only heartbeat (do not count as packet)
 };
 
 void loraInit();

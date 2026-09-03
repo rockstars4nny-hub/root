@@ -15,7 +15,8 @@ struct SubGhzHit {
   int8_t noiseFloor;
   uint8_t mac[6];
   char band[8];
-  char label[40];
+  char label[48];
+  char detail[40];   // hex / mode snippet for UI
   SubGhzDetect detect;
 };
 

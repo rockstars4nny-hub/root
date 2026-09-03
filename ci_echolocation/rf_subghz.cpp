@@ -21,9 +21,18 @@ static bool gEnabled = true;
 static bool gHopping = true;
 static float gFixedMhz = 433.92f;
 
-static const float BANDS_MHZ[] = {315.0f, 433.92f, 868.0f, 915.0f};
-static const char* BAND_NAMES[] = {"315", "433", "868", "915"};
-static const uint8_t BAND_N = 4;
+struct ScanSlot {
+  float mhz;
+  bool ook;
+  const char* name;
+};
+// 315/433 visited as OOK (remotes) and FSK; 868/915 FSK only.
+static const ScanSlot SLOTS[] = {
+    {315.0f, true, "315"},  {315.0f, false, "315"},
+    {433.92f, true, "433"}, {433.92f, false, "433"},
+    {868.0f, false, "868"}, {915.0f, false, "915"},
+};
+static const uint8_t SLOT_N = sizeof(SLOTS) / sizeof(SLOTS[0]);
 
 struct BandCal {
   float noiseEma = -110.0f;
@@ -32,15 +41,17 @@ struct BandCal {
   uint16_t bursts = 0;
   uint16_t packets = 0;
   uint32_t lastHitMs = 0;
+  uint32_t lastEmitMs = 0;
 };
 
-static BandCal gCal[BAND_N];
-static uint8_t gBandIdx = 0;
+static BandCal gCal[SLOT_N];
+static uint8_t gSlotIdx = 0;
 static uint32_t gBandEnterMs = 0;
 static uint32_t gLastStatusMs = 0;
 static uint32_t gTotalBursts = 0;
+static bool gCurrentOok = false;
 
-static SubGhzHit gHitQ[16];
+static SubGhzHit gHitQ[24];
 static uint8_t gHitHead = 0;
 static uint8_t gHitTail = 0;
 static const uint8_t kActivityMac[6] = {0x02, 0x53, 0x00, 0x00, 0x00, 0x01};
@@ -57,57 +68,84 @@ static char gSavePath[64] = "";
 
 static void pushHit(const SubGhzHit& h) {
   gHitQ[gHitHead] = h;
-  gHitHead = (gHitHead + 1) % 16;
-  if (gHitHead == gHitTail) gHitTail = (gHitTail + 1) % 16;
+  gHitHead = (gHitHead + 1) % 24;
+  if (gHitHead == gHitTail) gHitTail = (gHitTail + 1) % 24;
 }
 
-static void synthMac(uint8_t* mac, uint32_t freqKhz, SubGhzDetect det, uint8_t slot) {
+static void synthMac(uint8_t* mac, uint32_t freqKhz, SubGhzDetect det, int8_t rssi) {
+  // Locally administered unicast (02:53:…) — visible in the device list.
   mac[0] = 0x02;
   mac[1] = 0x53;
+  const uint8_t bucket = (uint8_t)(((int)rssi + 120) / 3);  // ~3 dB buckets
   mac[2] = (uint8_t)((freqKhz >> 16) & 0xff);
   mac[3] = (uint8_t)((freqKhz >> 8) & 0xff);
-  mac[4] = (uint8_t)(det);
-  mac[5] = slot;
+  mac[4] = (uint8_t)(freqKhz & 0xff);
+  mac[5] = (uint8_t)(((det & 0x07) << 5) | (bucket & 0x1f));
 }
 
-static void labelHit(SubGhzHit& h, BandCal& c) {
+static void synthMacFromPayload(uint8_t* mac, uint32_t freqKhz, const uint8_t* data,
+                                size_t len) {
+  uint32_t h = 2166136261u ^ freqKhz;
+  for (size_t i = 0; i < len; i++) {
+    h ^= data[i];
+    h *= 16777619u;
+  }
+  mac[0] = 0x02;
+  mac[1] = 0x53;
+  mac[2] = (uint8_t)(h >> 24);
+  mac[3] = (uint8_t)(h >> 16);
+  mac[4] = (uint8_t)(h >> 8);
+  mac[5] = (uint8_t)h;
+  if (mac[5] < 4) mac[5] |= 0x10;  // avoid activity monitor slots 0-3
+}
+
+static void labelHit(SubGhzHit& h, bool ook) {
   const float mhz = h.freqKhz / 1000.0f;
   const int above = h.rssi - h.noiseFloor;
-  switch (h.detect) {
-    case SG_CARRIER:
-      snprintf(h.label, sizeof(h.label), "%.0f MHz fixed emitter +%ddB", mhz, above);
-      break;
-    case SG_PACKET:
-      snprintf(h.label, sizeof(h.label), "%.0f MHz modulated +%ddB", mhz, above);
-      break;
-    case SG_BURST:
-    default:
-      snprintf(h.label, sizeof(h.label), "%.0f MHz burst +%ddB", mhz, above);
-      break;
+  const char* mode = ook ? "OOK" : "FSK";
+  const char* kind =
+      h.detect == SG_CARRIER ? "carrier" : h.detect == SG_PACKET ? "packet" : "burst";
+  snprintf(h.label, sizeof(h.label), "%.2f %s %s %+ddB", mhz, mode, kind, above);
+  if (!h.detail[0]) {
+    snprintf(h.detail, sizeof(h.detail), "nf %d · %s", (int)h.noiseFloor, kind);
   }
 }
 
-static void configureBand(float mhz) {
-  gRadio.setFrequency(mhz);
-  if (mhz < 350.0f) {
+static void configureSlot(const ScanSlot& sl) {
+  gRadio.setFrequency(sl.mhz);
+  gCurrentOok = sl.ook;
+  gRadio.setOOK(sl.ook);
+  if (sl.ook) {
+    gRadio.setRxBandwidth(270.0f);
+    gRadio.setBitRate(2.4f);
+    gRadio.setFrequencyDeviation(0.0f);
+  } else if (sl.mhz < 350.0f) {
     gRadio.setRxBandwidth(203.0f);
     gRadio.setBitRate(1.2f);
     gRadio.setFrequencyDeviation(5.2f);
-  } else if (mhz < 500.0f) {
-    gRadio.setRxBandwidth(101.0f);
-    gRadio.setBitRate(3.0f);
-    gRadio.setFrequencyDeviation(20.0f);
-  } else if (mhz < 900.0f) {
+  } else if (sl.mhz < 500.0f) {
+    gRadio.setRxBandwidth(135.0f);
+    gRadio.setBitRate(4.8f);
+    gRadio.setFrequencyDeviation(25.0f);
+  } else if (sl.mhz < 900.0f) {
     gRadio.setRxBandwidth(101.0f);
     gRadio.setBitRate(4.8f);
     gRadio.setFrequencyDeviation(45.0f);
   } else {
-    gRadio.setRxBandwidth(58.0f);
+    gRadio.setRxBandwidth(81.0f);
     gRadio.setBitRate(4.8f);
     gRadio.setFrequencyDeviation(45.0f);
   }
-  gRadio.setOOK(false);
   gRadio.startReceive();
+}
+
+static void configureBand(float mhz) {
+  ScanSlot sl = {mhz, mhz < 500.0f, "fix"};
+  if (mhz >= 800.0f && mhz < 900.0f) sl = {868.0f, false, "868"};
+  else if (mhz >= 900.0f) sl = {915.0f, false, "915"};
+  else if (mhz < 350.0f) sl = {315.0f, true, "315"};
+  else sl = {433.92f, true, "433"};
+  configureSlot(sl);
 }
 
 static void pushRaw(float mhz, int8_t rssi, uint8_t lqi, const uint8_t* data, uint8_t len) {
@@ -131,7 +169,7 @@ static void pushRaw(float mhz, int8_t rssi, uint8_t lqi, const uint8_t* data, ui
   gRawTotal++;
 }
 
-static void tryReadPacket(uint8_t bi) {
+static void tryReadPacket(uint8_t si) {
   if (!gOk || !gEnabled) return;
   size_t len = gRadio.getPacketLength(true);
   if (len == 0 || len > 255) {
@@ -152,9 +190,31 @@ static void tryReadPacket(uint8_t bi) {
   }
   int8_t rssi = gRadio.getRSSI();
   uint8_t lqi = (uint8_t)gRadio.getLQI();
-  pushRaw(BANDS_MHZ[bi], rssi, lqi, buf, (uint8_t)want);
-  gCal[bi].packets++;
+  const float mhz = SLOTS[si].mhz;
+  pushRaw(mhz, rssi, lqi, buf, (uint8_t)want);
+  gCal[si].packets++;
   gTotalBursts++;
+
+  // Promote demod payload to a device hit with payload-derived MAC + hex detail
+  BandCal& c = gCal[si];
+  SubGhzHit h = {};
+  h.freqKhz = (uint32_t)(mhz * 1000.0f);
+  h.rssi = rssi;
+  h.noiseFloor = (int8_t)c.noiseEma;
+  h.detect = SG_PACKET;
+  strncpy(h.band, SLOTS[si].name, sizeof h.band - 1);
+  synthMacFromPayload(h.mac, h.freqKhz, buf, want);
+  size_t di = 0;
+  di += (size_t)snprintf(h.detail + di, sizeof(h.detail) - di, "%uB LQI%u ",
+                         (unsigned)want, (unsigned)lqi);
+  for (size_t i = 0; i < want && di + 3 < sizeof(h.detail); i++) {
+    di += (size_t)snprintf(h.detail + di, sizeof(h.detail) - di, "%02X", buf[i]);
+    if (i + 1 < want && di + 1 < sizeof(h.detail)) h.detail[di++] = ' ';
+  }
+  labelHit(h, gCurrentOok);
+  pushHit(h);
+  c.lastHitMs = millis();
+  c.lastEmitMs = millis();
   gRadio.startReceive();
 }
 
@@ -172,26 +232,25 @@ bool subghzSetFrequencyMhz(float mhz) {
     gHopping = true;
     return true;
   }
-  // snap to nearest band
   uint8_t best = 0;
   float bestD = 1e9f;
-  for (uint8_t i = 0; i < BAND_N; i++) {
-    float d = fabsf(BANDS_MHZ[i] - mhz);
+  for (uint8_t i = 0; i < SLOT_N; i++) {
+    float d = fabsf(SLOTS[i].mhz - mhz);
     if (d < bestD) {
       bestD = d;
       best = i;
     }
   }
-  gFixedMhz = BANDS_MHZ[best];
+  gFixedMhz = SLOTS[best].mhz;
   gHopping = false;
-  gBandIdx = best;
+  gSlotIdx = best;
   if (gOk) {
-    configureBand(gFixedMhz);
+    configureSlot(SLOTS[best]);
     gBandEnterMs = millis();
   }
   return true;
 }
-float subghzCurrentMhz() { return gHopping ? BANDS_MHZ[gBandIdx] : gFixedMhz; }
+float subghzCurrentMhz() { return gHopping ? SLOTS[gSlotIdx].mhz : gFixedMhz; }
 uint32_t subghzPacketCount() { return gRawTotal ? gRawTotal : gTotalBursts; }
 
 uint32_t subghzRawCount() { return gRawCount; }
@@ -232,9 +291,9 @@ void subghzInit() {
   gOk = true;
   gEnabled = true;
   gHopping = true;
-  gBandIdx = 0;
+  gSlotIdx = 0;
   gBandEnterMs = millis();
-  configureBand(BANDS_MHZ[0]);
+  configureSlot(SLOTS[0]);
 
   gRawCap = ROOT_SUBGHZ_RAW_CAP;
   gRaw = (SubGhzRawPacket*)heap_caps_malloc(sizeof(SubGhzRawPacket) * gRawCap,
@@ -250,43 +309,50 @@ void subghzInit() {
   gRawCount = 0;
   gRawTotal = 0;
 
-  Serial.printf("root: CC1101 scanner 315/433/868/915 MHz (CS=%d GDO0=%d) raw_cap=%u\n",
+  Serial.printf("root: CC1101 scanner 315/433 OOK+FSK · 868/915 FSK (CS=%d GDO0=%d) raw_cap=%u\n",
                 ROOT_CC1101_CS, ROOT_CC1101_GDO0, (unsigned)gRawCap);
 }
 
-static void emit(BandCal& c, uint8_t bi, uint32_t freqKhz, int8_t rssi,
+static void emit(BandCal& c, uint8_t si, uint32_t freqKhz, int8_t rssi,
                  SubGhzDetect det) {
   const int8_t floor = (int8_t)c.noiseEma;
   const int delta = rssi - floor;
   if (delta < ROOT_SUBGHZ_BURST_DB) return;
+  const uint32_t now = millis();
+  if (c.lastEmitMs && (now - c.lastEmitMs) < ROOT_SUBGHZ_EMIT_GAP_MS &&
+      det != SG_PACKET) {
+    return;
+  }
 
   SubGhzHit h = {};
   h.freqKhz = freqKhz;
   h.rssi = rssi;
   h.noiseFloor = floor;
   h.detect = det;
-  strncpy(h.band, BAND_NAMES[bi], sizeof h.band - 1);
-  synthMac(h.mac, freqKhz, det, bi);
-  labelHit(h, c);
+  strncpy(h.band, SLOTS[si].name, sizeof h.band - 1);
+  synthMac(h.mac, freqKhz, det, rssi);
+  labelHit(h, gCurrentOok);
   pushHit(h);
-  c.lastHitMs = millis();
+  c.lastHitMs = now;
+  c.lastEmitMs = now;
   gTotalBursts++;
 
-  // Synthetic raw for RSSI-only bursts (no demod payload) — marker pattern
   if (det != SG_PACKET) {
-    uint8_t syn[12] = {0x02, 0x53, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    uint8_t syn[16] = {0x02, 0x53, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     syn[2] = (uint8_t)(freqKhz >> 16);
     syn[3] = (uint8_t)(freqKhz >> 8);
     syn[4] = (uint8_t)freqKhz;
     syn[5] = (uint8_t)det;
     syn[6] = (uint8_t)rssi;
-    pushRaw(BANDS_MHZ[bi], rssi, 0, syn, 12);
+    syn[7] = (uint8_t)floor;
+    syn[8] = gCurrentOok ? 1 : 0;
+    pushRaw(SLOTS[si].mhz, rssi, 0, syn, 12);
   }
 }
 
-static void sampleBand(uint8_t bi, uint32_t nowMs) {
-  BandCal& c = gCal[bi];
-  const uint32_t freqKhz = (uint32_t)(BANDS_MHZ[bi] * 1000.0f);
+static void sampleBand(uint8_t si, uint32_t nowMs) {
+  BandCal& c = gCal[si];
+  const uint32_t freqKhz = (uint32_t)(SLOTS[si].mhz * 1000.0f);
   int8_t peak = -120;
   uint8_t pktEdges = 0;
   bool gdoHigh = false;
@@ -296,8 +362,8 @@ static void sampleBand(uint8_t bi, uint32_t nowMs) {
     if (rssi > peak) peak = rssi;
     if (c.noiseEma < -99.0f) {
       c.noiseEma = (float)rssi;
-    } else if (rssi <= c.noiseEma + 2) {
-      c.noiseEma = c.noiseEma * 0.90f + (float)rssi * 0.10f;
+    } else if (rssi <= c.noiseEma + 3) {
+      c.noiseEma = c.noiseEma * 0.92f + (float)rssi * 0.08f;
     }
     if (digitalRead(ROOT_CC1101_GDO0)) {
       gdoHigh = true;
@@ -309,20 +375,20 @@ static void sampleBand(uint8_t bi, uint32_t nowMs) {
   c.peakRssi = peak;
   const int delta = peak - (int8_t)c.noiseEma;
 
-  tryReadPacket(bi);
+  tryReadPacket(si);
 
   if (gdoHigh && pktEdges >= 2) {
     c.packets++;
-    emit(c, bi, freqKhz, peak, SG_PACKET);
+    emit(c, si, freqKhz, peak, SG_PACKET);
   } else if (delta >= ROOT_SUBGHZ_BURST_DB) {
     c.bursts++;
-    emit(c, bi, freqKhz, peak, SG_BURST);
+    emit(c, si, freqKhz, peak, SG_BURST);
   }
 
   if (delta >= ROOT_SUBGHZ_CARRIER_DB) {
     if (c.carrierMs == 0) c.carrierMs = nowMs;
     if (nowMs - c.carrierMs >= ROOT_SUBGHZ_CARRIER_MS) {
-      emit(c, bi, freqKhz, peak, SG_CARRIER);
+      emit(c, si, freqKhz, peak, SG_CARRIER);
       c.carrierMs = nowMs;
     }
   } else {
@@ -335,53 +401,58 @@ void subghzService(uint32_t nowMs) {
 
   if (gHopping) {
     if (nowMs - gBandEnterMs >= ROOT_SUBGHZ_DWELL_MS) {
-      gBandIdx = (gBandIdx + 1) % BAND_N;
-      configureBand(BANDS_MHZ[gBandIdx]);
+      gSlotIdx = (gSlotIdx + 1) % SLOT_N;
+      configureSlot(SLOTS[gSlotIdx]);
       gBandEnterMs = nowMs;
     }
   }
 
-  sampleBand(gBandIdx, nowMs);
+  sampleBand(gSlotIdx, nowMs);
   gLastStatusMs = nowMs;
 }
 
 bool subghzPopHit(SubGhzHit* out) {
   if (!out || gHitHead == gHitTail) return false;
   *out = gHitQ[gHitTail];
-  gHitTail = (gHitTail + 1) % 16;
+  gHitTail = (gHitTail + 1) % 24;
   return true;
 }
 
 bool subghzPopActivity(SubGhzHit* out) {
   if (!out || !gOk || !gEnabled) return false;
 
-  uint8_t bestBi = gBandIdx;
-  int8_t bestPeak = gCal[gBandIdx].peakRssi;
-  const int8_t floor = (int8_t)gCal[gBandIdx].noiseEma;
-  int bestDelta = bestPeak - floor;
+  uint8_t bestSi = gSlotIdx;
+  int8_t bestPeak = gCal[gSlotIdx].peakRssi;
+  int bestDelta = bestPeak - (int8_t)gCal[gSlotIdx].noiseEma;
 
-  for (uint8_t i = 0; i < BAND_N; i++) {
+  for (uint8_t i = 0; i < SLOT_N; i++) {
     const int8_t peak = gCal[i].peakRssi;
     const int delta = peak - (int8_t)gCal[i].noiseEma;
     if (delta > bestDelta || (delta == bestDelta && peak > bestPeak)) {
       bestDelta = delta;
       bestPeak = peak;
-      bestBi = i;
+      bestSi = i;
     }
   }
 
   if (bestPeak < ROOT_SUBGHZ_ACTIVITY_RSSI && bestDelta < ROOT_SUBGHZ_BURST_DB) return false;
 
   SubGhzHit h = {};
-  h.freqKhz = (uint32_t)(BANDS_MHZ[bestBi] * 1000.0f);
+  h.freqKhz = (uint32_t)(SLOTS[bestSi].mhz * 1000.0f);
   h.rssi = bestPeak;
-  h.noiseFloor = (int8_t)gCal[bestBi].noiseEma;
+  h.noiseFloor = (int8_t)gCal[bestSi].noiseEma;
   h.detect = SG_BURST;
-  strncpy(h.band, BAND_NAMES[bestBi], sizeof h.band - 1);
+  strncpy(h.band, SLOTS[bestSi].name, sizeof h.band - 1);
   memcpy(h.mac, kActivityMac, 6);
-  h.mac[5] = bestBi;
+  // Monitor slot 0-3 by nominal band (315/433/868/915), not OOK/FSK index
+  uint8_t mon = 0;
+  if (SLOTS[bestSi].mhz >= 900) mon = 3;
+  else if (SLOTS[bestSi].mhz >= 800) mon = 2;
+  else if (SLOTS[bestSi].mhz >= 400) mon = 1;
+  h.mac[5] = mon;
   snprintf(h.label, sizeof(h.label), "%.0f MHz scan %ddBm (+%ddB)",
-           BANDS_MHZ[bestBi], (int)bestPeak, bestDelta);
+           SLOTS[bestSi].mhz, (int)bestPeak, bestDelta);
+  snprintf(h.detail, sizeof(h.detail), "%s monitor", SLOTS[bestSi].ook ? "OOK" : "FSK");
   *out = h;
   return true;
 }
@@ -390,13 +461,14 @@ void subghzStatusJson(char* out, size_t n) {
   if (!out || n < 8) return;
   snprintf(out, n,
            "{\"ready\":true,\"enabled\":%s,\"scan\":\"315,433,868,915\","
-           "\"hopping\":%s,\"band\":\"%s\",\"freq_mhz\":%.2f,"
+           "\"hopping\":%s,\"band\":\"%s\",\"freq_mhz\":%.2f,\"ook\":%s,"
            "\"rssi\":%d,\"noise_dbm\":%.1f,\"bursts\":%lu,\"raw\":%lu,"
            "\"burst_thresh_db\":%d,\"carrier_thresh_db\":%d}",
            gEnabled ? "true" : "false",
            gHopping ? "true" : "false",
-           BAND_NAMES[gBandIdx], subghzCurrentMhz(),
-           (int)gCal[gBandIdx].peakRssi, gCal[gBandIdx].noiseEma,
+           SLOTS[gSlotIdx].name, subghzCurrentMhz(),
+           gCurrentOok ? "true" : "false",
+           (int)gCal[gSlotIdx].peakRssi, gCal[gSlotIdx].noiseEma,
            (unsigned long)gTotalBursts, (unsigned long)gRawTotal,
            (int)ROOT_SUBGHZ_BURST_DB, (int)ROOT_SUBGHZ_CARRIER_DB);
 }

@@ -47,22 +47,26 @@
 #ifndef ROOT_LR22_M1
 #define ROOT_LR22_M1 7
 #endif
-// ms silence before treating UART burst as one LoRa packet
+// E22 transparent UART framing
 #ifndef ROOT_LORA_IDLE_MS
-#define ROOT_LORA_IDLE_MS 30
+#define ROOT_LORA_IDLE_MS 45
+#endif
+#ifndef ROOT_LORA_MIN_BYTES
+#define ROOT_LORA_MIN_BYTES 3
 #endif
 
-#define ROOT_SUBGHZ_DWELL_MS 320
-#define ROOT_SUBGHZ_SAMPLE_US 2000
-#define ROOT_SUBGHZ_SAMPLES 16
-#define ROOT_SUBGHZ_BURST_DB 4
-#define ROOT_SUBGHZ_CARRIER_DB 8
-#define ROOT_SUBGHZ_CARRIER_MS 1200
+#define ROOT_SUBGHZ_DWELL_MS 550
+#define ROOT_SUBGHZ_SAMPLE_US 1200
+#define ROOT_SUBGHZ_SAMPLES 28
+#define ROOT_SUBGHZ_BURST_DB 3
+#define ROOT_SUBGHZ_CARRIER_DB 6
+#define ROOT_SUBGHZ_CARRIER_MS 900
 #define ROOT_SUBGHZ_RSSI_FLOOR -110
 // Show live band scan on dashboard when peak RSSI exceeds this (dBm)
-#define ROOT_SUBGHZ_ACTIVITY_RSSI -102
-#define ROOT_SUBGHZ_STALE_MS 120000
-#define ROOT_LORA_STALE_MS 120000
+#define ROOT_SUBGHZ_ACTIVITY_RSSI -108
+#define ROOT_SUBGHZ_EMIT_GAP_MS 350
+#define ROOT_SUBGHZ_STALE_MS 180000
+#define ROOT_LORA_STALE_MS 180000
 
 // GPS NEO-6M / M10 (Serial1 — optional, off by default)
 #ifndef ROOT_ENABLE_GPS
@@ -91,7 +95,7 @@
 #define ROOT_AP_PASS "root-radar"
 #endif
 #ifndef ROOT_AP_CHANNEL
-#define ROOT_AP_CHANNEL 6
+#define ROOT_AP_CHANNEL 1
 #endif
 // esp_wifi_set_max_tx_power units: 0.25 dBm (78 ≈ 19.5 dBm, legal US max)
 #ifndef ROOT_WIFI_TX_QUARTER_DBM

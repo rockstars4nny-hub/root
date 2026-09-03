@@ -44,6 +44,7 @@ static bool macEq(const uint8_t* a, const uint8_t* b) {
 
 static void pushHit(const uint8_t* mac, int8_t rssi, const char* name) {
   if (!mac) return;
+  if (macEq(mac, gSelfMac)) return;  // never track our own BLE address
   BleHit& h = gHits[gHitHead];
   memcpy(h.mac, mac, 6);
   h.rssi = rssi;
@@ -221,6 +222,21 @@ void bleGetMacStr(char* out, size_t n) {
   out[n - 1] = 0;
 }
 
+bool bleGetMac(uint8_t out[6]) {
+  if (!out) return false;
+  static const uint8_t z[6] = {0};
+  if (macEq(gSelfMac, z)) return false;
+  memcpy(out, gSelfMac, 6);
+  return true;
+}
+
+bool bleIsSelfMac(const uint8_t* mac) {
+  if (!mac) return false;
+  static const uint8_t z[6] = {0};
+  if (macEq(gSelfMac, z)) return false;
+  return macEq(mac, gSelfMac);
+}
+
 bool bleListText(char* out, size_t n, const char* nameFilter) {
   if (!out || !n) return false;
   size_t u = 0;
@@ -298,6 +314,11 @@ uint32_t bleTrackedCount() { return 0; }
 void bleGetMacStr(char* out, size_t n) {
   if (out && n) out[0] = 0;
 }
+bool bleGetMac(uint8_t out[6]) {
+  if (out) memset(out, 0, 6);
+  return false;
+}
+bool bleIsSelfMac(const uint8_t*) { return false; }
 bool bleListText(char* out, size_t n, const char*) {
   if (out && n) snprintf(out, n, "=== BLE DEVICES ===\nBLE disabled in build\n");
   return true;

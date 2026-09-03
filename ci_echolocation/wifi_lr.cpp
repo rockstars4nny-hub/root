@@ -81,17 +81,10 @@ void wifiLrInit() {
   gSent = gAcked = 0;
   gRssi = -90;
 
-  // Keep b/g/n for phone SoftAP clients; OR in Espressif LR for ESP↔ESP reach.
-  // Do NOT use WiFi.enableLongRange(true) alone — that replaces protocols with LR-only.
-  const uint8_t proto =
-      WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR;
-  esp_err_t err = esp_wifi_set_protocol(WIFI_IF_AP, proto);
-  gProtoOk = (err == ESP_OK);
-  if (gProtoOk) {
-    Serial.println("root: Wi-Fi LR enabled (b/g/n + LR on SoftAP)");
-  } else {
-    Serial.printf("root: Wi-Fi LR protocol set failed: %d\n", (int)err);
-  }
+  // SoftAP stays b/g/n only. ORing WIFI_PROTOCOL_LR before BLE init aborts in
+  // coex_core_enable on ESP32-S3 (boot crash loop → SSID never stays visible).
+  // ESP-NOW still works on normal SoftAP; LR phy is optional via wifiLrEnableLongRange().
+  Serial.println("root: SoftAP protocol b/g/n (LR phy off — keeps BLE + phone SoftAP stable)");
 
   if (esp_now_init() != ESP_OK) {
     Serial.println("root: ESP-NOW init failed");
@@ -103,7 +96,22 @@ void wifiLrInit() {
   Serial.println("root: ESP-NOW ready (./omni lr peer|send|test)");
 }
 
-bool wifiLrReady() { return gProtoOk && gNowOk; }
+bool wifiLrEnableLongRange(bool on) {
+  uint8_t proto = WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N;
+  if (on) proto |= WIFI_PROTOCOL_LR;
+  // Do NOT use WiFi.enableLongRange(true) alone — that replaces protocols with LR-only.
+  esp_err_t err = esp_wifi_set_protocol(WIFI_IF_AP, proto);
+  gProtoOk = (err == ESP_OK) && on;
+  if (err != ESP_OK) {
+    Serial.printf("root: Wi-Fi LR protocol set failed: %d\n", (int)err);
+    return false;
+  }
+  Serial.println(on ? "root: Wi-Fi LR phy OR'd on SoftAP (disable BLE if coex aborts)"
+                    : "root: Wi-Fi LR phy cleared — SoftAP b/g/n only");
+  return true;
+}
+
+bool wifiLrReady() { return gNowOk; }
 bool wifiLrProtocolOk() { return gProtoOk; }
 
 bool wifiLrSetPeer(const char* macStr) {

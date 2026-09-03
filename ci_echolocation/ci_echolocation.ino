@@ -122,6 +122,9 @@ using DevMap = std::unordered_map<uint64_t, Device, std::hash<uint64_t>,
 static DevMap* gDev = nullptr;
 static uint8_t gSelfMac[6] = {0};
 static uint8_t gApMac[6] = {0};
+// Own radios (Wi-Fi STA / SoftAP / BLE / family) — drop from scan results.
+static uint8_t gExcludeMacs[12][6] = {};
+static uint8_t gExcludeCount = 0;
 static volatile uint8_t gChannel = AP_CHANNEL;
 static volatile bool gHopEnable = false;
 static uint32_t gLastHopMs = 0;
@@ -139,13 +142,17 @@ static size_t gJsonCap = 0;
 
 // —— OmniScan state ——
 static bool gOmniRunning = true;
-static bool gBleScanIntent = true;  // onboard BLE on by default
+static bool gBleScanIntent = true;  // BLE on after SoftAP settle (needs modem sleep coex)
 static char gBleFilter[40] = "";
 static char gLrPeer[18] = "";
 static char gApSsidBuf[33] = ROOT_AP_SSID;
 static uint32_t gHandshakeCount = 0;
 static uint32_t gDeauthCount = 0;
 static uint32_t gLoraPktCount = 0;
+static bool gSoftApUp = false;
+static uint32_t gLastApCheckMs = 0;
+static bool gPromiscDeferred = true;
+static bool gBleDeferred = true;
 static struct {
   uint8_t attacker[6];
   uint8_t target[6];
@@ -172,13 +179,67 @@ static bool macEq(const uint8_t* a, const uint8_t* b) {
   return memcmp(a, b, 6) == 0;
 }
 
+static void purgeExcludedDevices();
+
+static void excludeMacAdd(const uint8_t* mac) {
+  if (!mac) return;
+  static const uint8_t z[6] = {0};
+  if (macEq(mac, z)) return;
+  for (uint8_t i = 0; i < gExcludeCount; i++) {
+    if (macEq(gExcludeMacs[i], mac)) return;
+  }
+  if (gExcludeCount >= (uint8_t)(sizeof gExcludeMacs / sizeof gExcludeMacs[0])) return;
+  memcpy(gExcludeMacs[gExcludeCount++], mac, 6);
+  purgeExcludedDevices();
+}
+
+// ESP32 typically derives SoftAP (U/L bit) and BLE (+1) from the STA base MAC.
+static void excludeSelfFamily(const uint8_t* base) {
+  if (!base) return;
+  excludeMacAdd(base);
+  uint8_t ap[6];
+  memcpy(ap, base, 6);
+  ap[0] = (uint8_t)(ap[0] | 0x02);
+  excludeMacAdd(ap);
+  uint8_t ble[6];
+  memcpy(ble, base, 6);
+  ble[5] = (uint8_t)(ble[5] + 1);
+  excludeMacAdd(ble);
+}
+
 static bool macIgnored(const uint8_t* mac) {
-  if (mac[0] & 0x01) return true;
+  if (!mac) return true;
+  if (mac[0] & 0x01) return true;  // multicast/broadcast
   static const uint8_t z[6] = {0};
   static const uint8_t f[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
   if (macEq(mac, z) || macEq(mac, f)) return true;
+  for (uint8_t i = 0; i < gExcludeCount; i++) {
+    if (macEq(gExcludeMacs[i], mac)) return true;
+  }
   if (macEq(mac, gSelfMac) || macEq(mac, gApMac)) return true;
+#if ROOT_ENABLE_BLE
+  if (bleIsSelfMac(mac)) return true;
+#endif
   return false;
+}
+
+static void purgeExcludedDevices() {
+  if (!gDev) return;
+  if (!gMux || xSemaphoreTake(gMux, pdMS_TO_TICKS(50)) != pdTRUE) return;
+  for (auto it = gDev->begin(); it != gDev->end();) {
+    bool drop = false;
+    const uint8_t* m = it->second.mac;
+    if ((m[0] & 0x01) || macEq(m, gSelfMac) || macEq(m, gApMac)) drop = true;
+#if ROOT_ENABLE_BLE
+    if (!drop && bleIsSelfMac(m)) drop = true;
+#endif
+    for (uint8_t i = 0; !drop && i < gExcludeCount; i++) {
+      if (macEq(gExcludeMacs[i], m)) drop = true;
+    }
+    if (drop) it = gDev->erase(it);
+    else ++it;
+  }
+  xSemaphoreGive(gMux);
 }
 
 static bool macZero(const uint8_t* mac) {
@@ -388,6 +449,7 @@ static void snifferCb(void* buf, wifi_promiscuous_pkt_type_t type) {
 }
 
 static void ingestHit(const SniffHit& hit) {
+  if (macIgnored(hit.mac)) return;
   if (!gDev || xSemaphoreTake(gMux, pdMS_TO_TICKS(20)) != pdTRUE) return;
 
   const uint64_t key = macKey(hit.mac);
@@ -509,10 +571,21 @@ static void ingestSubGhz(const SubGhzHit& sg) {
   SniffHit hit{};
   memcpy(hit.mac, sg.mac, 6);
   hit.rssi = sg.rssi;
-  hit.channel = 0;
+  // Compact band id in channel (1=315,2=433,3=868,4=915) — uint8 cannot hold MHz.
+  const uint16_t mhz = (uint16_t)((sg.freqKhz + 500) / 1000);
+  hit.channel = (mhz >= 900) ? 4 : (mhz >= 800) ? 3 : (mhz >= 400) ? 2 : 1;
   hit.kind = KIND_SUBGHZ;
   strncpy(hit.band, "subghz", sizeof hit.band - 1);
   snprintf(hit.ssid, sizeof hit.ssid, "%s", sg.label[0] ? sg.label : sg.band);
+  strncpy(hit.vendor, "CC1101", sizeof hit.vendor - 1);
+  if (sg.detail[0]) {
+    strncpy(hit.encrypt, sg.detail, sizeof hit.encrypt - 1);
+  } else {
+    const char* kind = sg.detect == SG_CARRIER   ? "carrier"
+                       : sg.detect == SG_PACKET ? "packet"
+                                                : "burst";
+    snprintf(hit.encrypt, sizeof hit.encrypt, "%s", kind);
+  }
   ingestHit(hit);
 }
 
@@ -524,17 +597,25 @@ static void serviceSubGhz(uint32_t nowMs) {
 }
 
 static void ingestLora(const LoraHit& lh) {
+  if (lh.activity) return;  // status heartbeat — not a device / not a packet
   gLoraPktCount++;
   SniffHit hit{};
   memcpy(hit.mac, lh.mac, 6);
   hit.rssi = lh.rssi;
-  hit.channel = 0;
+  hit.channel = 4;  // 915 MHz band id (same encoding as Sub-GHz)
   hit.kind = KIND_LORA;
+  hit.frameLen = lh.len;
   strncpy(hit.band, "lora", sizeof hit.band - 1);
   if (lh.label[0]) {
     strncpy(hit.ssid, lh.label, sizeof hit.ssid - 1);
   } else {
     strncpy(hit.ssid, "915 MHz LoRa", sizeof hit.ssid - 1);
+  }
+  strncpy(hit.vendor, "E22-LR22", sizeof hit.vendor - 1);
+  if (lh.detail[0]) {
+    strncpy(hit.encrypt, lh.detail, sizeof hit.encrypt - 1);
+  } else {
+    snprintf(hit.encrypt, sizeof hit.encrypt, "%uB", (unsigned)lh.len);
   }
   ingestHit(hit);
 }
@@ -543,7 +624,7 @@ static void serviceLora(uint32_t nowMs) {
   loraPoll(nowMs);
   LoraHit lh;
   while (loraPopHit(&lh)) ingestLora(lh);
-  if (loraPopActivity(&lh)) ingestLora(lh);
+  // Activity is status-only (monitor via /api/rf) — do not invent device rows.
 }
 
 static void ingestBle(const BleHit& bh) {
@@ -758,6 +839,8 @@ static size_t buildJson() {
 static void lockApChannel();
 static void setChannelManual(uint8_t ch, bool hop);
 static bool bringUpSoftAp();
+static bool softApAlive();
+static void serviceSoftAp(uint32_t now);
 
 static void lockApChannel() {
   if (gChannel == AP_CHANNEL) return;
@@ -794,7 +877,7 @@ static OmniSnapshot omniSnap() {
   s.gpsSpeedKmh = g.speedKmh;
   s.gpsSats = 0;
   s.gpsHdop = g.hdop;
-  s.apOn = true;
+  s.apOn = gSoftApUp && softApAlive();
   strncpy(s.apSsid, gApSsidBuf[0] ? gApSsidBuf : AP_SSID, sizeof s.apSsid - 1);
   s.apChannel = AP_CHANNEL;
   s.apClients = (uint8_t)WiFi.softAPgetStationNum();
@@ -826,7 +909,8 @@ static bool omniSetRunning(bool on) {
     esp_wifi_set_promiscuous(true);
     subghzSetEnabled(true);
     gBleScanIntent = true;
-    bleSetEnabled(true);
+    if (bleReady()) bleSetEnabled(true);
+    else gBleDeferred = true;  // arm on next SoftAP service pass
   } else {
     bleSetEnabled(false);
   }
@@ -849,7 +933,19 @@ static bool omniSetWifiCh(int ch) {
 }
 static bool omniSetBle(bool on) {
   gBleScanIntent = on;
+  if (on) {
+    // ESP32-S3 coex requires modem sleep when BT is on — WIFI_PS_NONE aborts.
+    WiFi.setSleep(true);
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+    if (!bleReady()) {
+      bleInit();
+    }
+  }
   bleSetEnabled(on);
+  if (!on) {
+    WiFi.setSleep(false);
+    esp_wifi_set_ps(WIFI_PS_NONE);
+  }
   return true;
 }
 static bool omniSetSg(bool on) {
@@ -1140,10 +1236,19 @@ static void answerCaptive(AsyncWebServerRequest* req) {
   req->redirect("http://192.168.4.1/");
 }
 
+static bool softApAlive() {
+  wifi_mode_t mode = WIFI_MODE_NULL;
+  if (esp_wifi_get_mode(&mode) != ESP_OK) return false;
+  if (mode != WIFI_MODE_AP && mode != WIFI_MODE_APSTA) return false;
+  if (WiFi.softAPIP() == IPAddress(0, 0, 0, 0)) return false;
+  return true;
+}
+
 static void configureApRadio() {
-  WiFi.mode(WIFI_AP);
-  WiFi.setSleep(false);
-  esp_wifi_set_ps(WIFI_PS_NONE);
+  // ESP32-S3: WIFI_PS_NONE + Bluetooth aborts. Modem sleep only once BLE controller is up.
+  const bool bleCoex = bleReady() || bleEnabled();
+  WiFi.setSleep(bleCoex);
+  esp_wifi_set_ps(bleCoex ? WIFI_PS_MIN_MODEM : WIFI_PS_NONE);
   esp_wifi_set_inactive_time(WIFI_IF_AP, 0);
 
   wifi_country_t country = {};
@@ -1161,45 +1266,64 @@ static void configureApRadio() {
   esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
 }
 
+// SoftAP bring-up. Avoid needless WIFI_OFF churn on a healthy AP — that kills beacons.
 static bool bringUpSoftAp() {
-  WiFi.softAPdisconnect(true);
-  delay(80);
-  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1),
-                    IPAddress(255, 255, 255, 0));
+  WiFi.persistent(false);
 
   bool ok = false;
-  for (uint8_t attempt = 0; attempt < 3 && !ok; attempt++) {
+  for (uint8_t attempt = 0; attempt < 4 && !ok; attempt++) {
+    if (attempt > 0) {
+      WiFi.softAPdisconnect(true);
+      WiFi.mode(WIFI_OFF);
+      delay(200);
+    }
+    WiFi.mode(WIFI_AP);
+    delay(80);
+    configureApRadio();
+    WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1),
+                      IPAddress(255, 255, 255, 0));
+
     const char* ssid = gApSsidBuf[0] ? gApSsidBuf : AP_SSID;
     if (AP_PASS && strlen(AP_PASS) >= 8) {
       ok = WiFi.softAP(ssid, AP_PASS, AP_CHANNEL, 0, 8);
     } else {
       ok = WiFi.softAP(ssid, nullptr, AP_CHANNEL, 0, 8);
     }
-    if (!ok) delay(250);
+    delay(250);
+    ok = ok && softApAlive();
+    if (!ok) {
+      Serial.printf("root: SoftAP attempt %u failed\n", (unsigned)(attempt + 1));
+    }
   }
-  delay(200);
-  return ok && WiFi.softAPIP() != IPAddress(0, 0, 0, 0);
+  gSoftApUp = ok;
+  return ok;
 }
 
-static void startRadio() {
-  configureApRadio();
-  const bool ok = bringUpSoftAp();
-  gChannel = AP_CHANNEL;
-  gHopEnable = false;
-
-  WiFi.macAddress(gSelfMac);
-  WiFi.softAPmacAddress(gApMac);
-
-  gDns.start(53, "*", WiFi.softAPIP());
-
+static void armPromiscuous() {
   esp_wifi_set_channel(AP_CHANNEL, WIFI_SECOND_CHAN_NONE);
-
   wifi_promiscuous_filter_t filter = {};
   filter.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA;
   esp_wifi_set_promiscuous_filter(&filter);
   esp_wifi_set_promiscuous_rx_cb(&snifferCb);
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_channel(AP_CHANNEL, WIFI_SECOND_CHAN_NONE);
+}
+
+static void startRadio() {
+  const bool ok = bringUpSoftAp();
+  gChannel = AP_CHANNEL;
+  gHopEnable = false;
+  gSoftApUp = ok;
+
+  WiFi.macAddress(gSelfMac);
+  WiFi.softAPmacAddress(gApMac);
+  excludeSelfFamily(gSelfMac);
+  excludeMacAdd(gApMac);
+
+  gDns.start(53, "*", WiFi.softAPIP());
+  // Defer promiscuous + BLE: SoftAP beacons first, then coex-safe BLE, then sniffer.
+  gPromiscDeferred = true;
+  gBleDeferred = true;
 
   int8_t txQuarterDbm = 0;
   esp_wifi_get_max_tx_power(&txQuarterDbm);
@@ -1208,16 +1332,58 @@ static void startRadio() {
   Serial.printf("root: join '%s' (ch %u, tx %.1f dBm) → http://%s\n",
                 AP_SSID, (unsigned)AP_CHANNEL, txQuarterDbm * 0.25f,
                 WiFi.softAPIP().toString().c_str());
+  Serial.println("root: SoftAP beacons first — BLE + promiscuous arm after SoftAP settle");
   Serial.println("root: no internet on this AP is normal — phone stays connected via captive DNS");
-  Serial.println("root: hop auto moves RX only when no clients — AP stays on ch 6 most of the time");
 
   char m1[18], m2[18];
   macStr(gSelfMac, m1, sizeof(m1));
   macStr(gApMac, m2, sizeof(m2));
   Serial.printf("root: self MAC %s  AP MAC %s\n", m1, m2);
-  Serial.println("root: promiscuous listen armed — unlimited device table (PSRAM)");
+  Serial.printf("root: SoftAPSSID='%s' IP=%s stations=%u\n",
+                WiFi.softAPSSID().c_str(),
+                WiFi.softAPIP().toString().c_str(),
+                (unsigned)WiFi.softAPgetStationNum());
+  Serial.printf("root: self-MAC exclude list (%u)\n", (unsigned)gExcludeCount);
+}
 
-  wifiLrInit();
+static void armBleAfterSoftAp() {
+#if ROOT_ENABLE_BLE
+  if (!gBleScanIntent) return;
+  // Required before esp_bt_controller_enable on S3 with Wi-Fi SoftAP.
+  WiFi.setSleep(true);
+  esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+  delay(50);
+  if (!bleReady()) bleInit();
+  bleSetEnabled(true);
+  uint8_t bleMac[6];
+  if (bleGetMac(bleMac)) excludeMacAdd(bleMac);
+  Serial.println("root: BLE scanner armed (Wi-Fi modem sleep on for coex)");
+#endif
+}
+
+// Keep SoftAP alive; only restart if the AP interface actually died.
+static void serviceSoftAp(uint32_t now) {
+  // SoftAP-only window first so phones can join; then BLE + sniffer + ESP-NOW.
+  if (gBleDeferred && now >= 8000) {
+    gBleDeferred = false;
+    armBleAfterSoftAp();
+  }
+  if (gPromiscDeferred && now >= 12000) {
+    gPromiscDeferred = false;
+    armPromiscuous();
+    wifiLrInit();
+    Serial.println("root: promiscuous + ESP-NOW armed");
+  }
+
+  if (now - gLastApCheckMs < 4000) return;
+  gLastApCheckMs = now;
+  gSoftApUp = softApAlive();
+  if (gSoftApUp) return;
+
+  Serial.println("root: SoftAP down — restarting");
+  bringUpSoftAp();
+  WiFi.softAPmacAddress(gApMac);
+  if (!gPromiscDeferred) armPromiscuous();
 }
 
 static void startWeb() {
@@ -1445,7 +1611,8 @@ static void startWeb() {
 
 void setup() {
   Serial.begin(115200);
-  delay(400);
+  // USB VBUS / 3V3 need settle time before RF — cold plug SoftAP fails without this.
+  delay(900);
   Serial.println();
   Serial.println("========================================");
   Serial.println("  root  — Wi-Fi LR + BLE + CC1101 + LR22");
@@ -1466,11 +1633,9 @@ void setup() {
   }
 
   ledWrite(0, 12, 4);
+  // SoftAP first (beacon window). BLE arms ~8s later with modem sleep — never with WIFI_PS_NONE.
   startRadio();
-#if ROOT_ENABLE_BLE
-  bleInit();
-  bleSetEnabled(gBleScanIntent);
-#endif
+  Serial.println("root: SoftAP up — BLE arms at ~8s, sniffer/ESP-NOW at ~12s");
 #if ROOT_ENABLE_SUBGHZ
   subghzInit();
 #endif
@@ -1549,6 +1714,7 @@ static void serviceSerialCmds() {
 void loop() {
   for (int i = 0; i < 32; i++) gDns.processNextRequest();
   const uint32_t now = millis();
+  serviceSoftAp(now);
   gpsPoll();  // UART when ROOT_ENABLE_GPS; inject TTL handled in gpsGet()
   SniffHit hit;
   int budget = 20;

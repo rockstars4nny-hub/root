@@ -4,8 +4,9 @@
 
 /** Espressif 802.11 Long-Range (WIFI_PROTOCOL_LR) + ESP-NOW peer path */
 
-void wifiLrInit();                 // call after SoftAP is up
-bool wifiLrReady();                // LR protocol + ESP-NOW up
+void wifiLrInit();                 // ESP-NOW after SoftAP (keeps SoftAP b/g/n)
+bool wifiLrEnableLongRange(bool on);  // optional LR phy — conflicts with BLE coex on S3
+bool wifiLrReady();                // ESP-NOW up
 bool wifiLrProtocolOk();           // AP has LR bit set with b/g/n
 bool wifiLrSetPeer(const char* macStr);
 bool wifiLrSend(const char* msg);
