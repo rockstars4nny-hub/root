@@ -60,6 +60,8 @@ struct OmniHooks {
   bool (*setBleScan)(bool on);
   bool (*setSubghzScan)(bool on);
   bool (*setSubghzFreq)(float mhz);        // 0 = hop
+  bool (*setSubghzDwell)(float bandMhz, uint32_t ms);  // band 0 = all OOK
+  bool (*subghzDwellStatus)(char* out, size_t n);
   bool (*setLoraScan)(bool on);
   bool (*setLoraFreq)(float mhz);
   bool (*gpsReset)();

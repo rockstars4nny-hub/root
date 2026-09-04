@@ -965,6 +965,12 @@ static bool omniSetSg(bool on) {
 static bool omniSetSgFreq(float mhz) {
   return subghzSetFrequencyMhz(mhz);
 }
+static bool omniSetSgDwell(float bandMhz, uint32_t ms) {
+  return subghzSetOokDwellMs(bandMhz, (uint16_t)ms);
+}
+static bool omniSgDwellStatus(char* out, size_t n) {
+  return subghzFormatDwell(out, n);
+}
 static bool omniSetLora(bool on) {
   (void)on;
   return loraReady();
@@ -1181,7 +1187,8 @@ static bool omniLoraList(char* out, size_t n) {
 static void omniSetupHooks() {
   static OmniHooks hooks = {
       omniSnap,        omniSetRunning, omniSetWifiCh,   omniSetBle,
-      omniSetSg,       omniSetSgFreq,  omniSetLora,     omniSetLoraFreq,
+      omniSetSg,       omniSetSgFreq,  omniSetSgDwell,  omniSgDwellStatus,
+      omniSetLora,     omniSetLoraFreq,
       omniGpsReset,    omniSetAp,      omniSetApSsid,   omniSetLrPeer,
       omniLrSend,      omniLrTest,     omniLogSave,     omniLogDump,
       omniSysReset,    omniWifiHs,     omniWifiDe,      omniBleList,
@@ -1195,7 +1202,7 @@ static size_t gOmniOutCap = 0;
 
 static char* omniOutBuf() {
   if (!gOmniOut) {
-    gOmniOutCap = 24576;
+    gOmniOutCap = 131072;
     gOmniOut = (char*)heap_caps_malloc(gOmniOutCap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!gOmniOut) {
       gOmniOutCap = 8192;
@@ -1737,7 +1744,7 @@ static void startWeb() {
     req->send(r);
   });
 
-  // Recent Sub-GHz raw captures with HEX (bursts + packets)
+  // Recent Sub-GHz raw — every payload format from firmware (no client decode)
   gServer.on("/api/subghz/raw", HTTP_GET, [](AsyncWebServerRequest* req) {
     uint32_t want = 20;
     if (req->hasParam("n")) {
@@ -1746,9 +1753,31 @@ static void startWeb() {
     }
     const uint32_t have = subghzRawCount();
     if (want > have) want = have;
+    auto jesc = [](String& s, char c) {
+      if (c == '"' || c == '\\') s += '\\';
+      s += c;
+    };
+    auto b64one = [](const uint8_t* in, uint8_t n, String& out) {
+      static const char* T =
+          "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+      for (uint8_t i = 0; i < n; i += 3) {
+        uint32_t v = ((uint32_t)in[i]) << 16;
+        if (i + 1 < n) v |= ((uint32_t)in[i + 1]) << 8;
+        if (i + 2 < n) v |= in[i + 2];
+        out += T[(v >> 18) & 63];
+        out += T[(v >> 12) & 63];
+        out += (i + 1 < n) ? T[(v >> 6) & 63] : '=';
+        out += (i + 2 < n) ? T[v & 63] : '=';
+      }
+    };
     String body;
-    body.reserve(256 + want * 200);
-    body += "{\"ok\":true,\"total\":";
+    body.reserve(1024 + want * 6000);
+    body += "{\"ok\":true,\"bit_us\":";
+    body += String((unsigned)ROOT_SUBGHZ_BIT_US);
+    body += ",\"formats\":[\"hex\",\"hex_contig\",\"ascii\",\"utf8\",\"base64\","
+            "\"bits\",\"bits_contig\",\"nibbles\",\"dec\",\"oct\","
+            "\"s8\",\"u8\",\"s16_be\",\"u16_be\",\"s16_le\",\"u16_le\","
+            "\"s32_be\",\"u32_be\",\"s32_le\",\"u32_le\"],\"total\":";
     body += String((unsigned long)subghzRawTotal());
     body += ",\"count\":";
     body += String((unsigned)want);
@@ -1765,12 +1794,124 @@ static void startWeb() {
       body += String((int)pk.rssi);
       body += ",\"len\":";
       body += String((unsigned)pk.length);
+      body += ",\"bit_count\":";
+      body += String((unsigned)pk.length * 8u);
       body += ",\"hex\":\"";
-      char hx[4];
       for (uint8_t b = 0; b < pk.length; b++) {
+        char hx[4];
         snprintf(hx, sizeof hx, "%02X", pk.data[b]);
         body += hx;
         if (b + 1 < pk.length) body += ' ';
+      }
+      body += "\",\"hex_contig\":\"";
+      for (uint8_t b = 0; b < pk.length; b++) {
+        char hx[4];
+        snprintf(hx, sizeof hx, "%02X", pk.data[b]);
+        body += hx;
+      }
+      body += "\",\"ascii\":\"";
+      for (uint8_t b = 0; b < pk.length; b++) {
+        char c = (pk.data[b] >= 32 && pk.data[b] < 127) ? (char)pk.data[b] : '.';
+        jesc(body, c);
+      }
+      body += "\",\"utf8\":\"";
+      for (uint8_t b = 0; b < pk.length; b++) {
+        char c = (pk.data[b] >= 32 && pk.data[b] < 127) ? (char)pk.data[b] : '.';
+        jesc(body, c);
+      }
+      body += "\",\"base64\":\"";
+      b64one(pk.data, pk.length, body);
+      body += "\",\"bits\":\"";
+      for (uint8_t b = 0; b < pk.length; b++) {
+        for (int bit = 7; bit >= 0; bit--)
+          body += ((pk.data[b] >> bit) & 1) ? '1' : '0';
+        if (b + 1 < pk.length) body += ' ';
+      }
+      body += "\",\"bits_contig\":\"";
+      for (uint8_t b = 0; b < pk.length; b++) {
+        for (int bit = 7; bit >= 0; bit--)
+          body += ((pk.data[b] >> bit) & 1) ? '1' : '0';
+      }
+      body += "\",\"nibbles\":\"";
+      for (uint8_t b = 0; b < pk.length; b++) {
+        char nb[8];
+        snprintf(nb, sizeof nb, "%X %X", (pk.data[b] >> 4) & 0xF, pk.data[b] & 0xF);
+        body += nb;
+        if (b + 1 < pk.length) body += ' ';
+      }
+      body += "\",\"dec\":\"";
+      for (uint8_t b = 0; b < pk.length; b++) {
+        body += String((unsigned)pk.data[b]);
+        if (b + 1 < pk.length) body += ' ';
+      }
+      body += "\",\"oct\":\"";
+      for (uint8_t b = 0; b < pk.length; b++) {
+        char o[8];
+        snprintf(o, sizeof o, "%o", (unsigned)pk.data[b]);
+        body += o;
+        if (b + 1 < pk.length) body += ' ';
+      }
+      body += "\",\"s8\":\"";
+      for (uint8_t b = 0; b < pk.length; b++) {
+        body += String((int)(int8_t)pk.data[b]);
+        if (b + 1 < pk.length) body += ' ';
+      }
+      body += "\",\"u8\":\"";
+      for (uint8_t b = 0; b < pk.length; b++) {
+        body += String((unsigned)pk.data[b]);
+        if (b + 1 < pk.length) body += ' ';
+      }
+      body += "\",\"s16_be\":\"";
+      for (uint8_t b = 0; b + 1 < pk.length; b += 2) {
+        int16_t v = (int16_t)(((uint16_t)pk.data[b] << 8) | pk.data[b + 1]);
+        body += String((int)v);
+        if (b + 2 < pk.length) body += ' ';
+      }
+      body += "\",\"u16_be\":\"";
+      for (uint8_t b = 0; b + 1 < pk.length; b += 2) {
+        uint16_t v = ((uint16_t)pk.data[b] << 8) | pk.data[b + 1];
+        body += String((unsigned)v);
+        if (b + 2 < pk.length) body += ' ';
+      }
+      body += "\",\"s16_le\":\"";
+      for (uint8_t b = 0; b + 1 < pk.length; b += 2) {
+        int16_t v = (int16_t)(((uint16_t)pk.data[b + 1] << 8) | pk.data[b]);
+        body += String((int)v);
+        if (b + 2 < pk.length) body += ' ';
+      }
+      body += "\",\"u16_le\":\"";
+      for (uint8_t b = 0; b + 1 < pk.length; b += 2) {
+        uint16_t v = ((uint16_t)pk.data[b + 1] << 8) | pk.data[b];
+        body += String((unsigned)v);
+        if (b + 2 < pk.length) body += ' ';
+      }
+      body += "\",\"s32_be\":\"";
+      for (uint8_t b = 0; b + 3 < pk.length; b += 4) {
+        int32_t v = (int32_t)(((uint32_t)pk.data[b] << 24) | ((uint32_t)pk.data[b + 1] << 16) |
+                              ((uint32_t)pk.data[b + 2] << 8) | pk.data[b + 3]);
+        body += String((long)v);
+        if (b + 4 < pk.length) body += ' ';
+      }
+      body += "\",\"u32_be\":\"";
+      for (uint8_t b = 0; b + 3 < pk.length; b += 4) {
+        uint32_t v = ((uint32_t)pk.data[b] << 24) | ((uint32_t)pk.data[b + 1] << 16) |
+                     ((uint32_t)pk.data[b + 2] << 8) | pk.data[b + 3];
+        body += String((unsigned long)v);
+        if (b + 4 < pk.length) body += ' ';
+      }
+      body += "\",\"s32_le\":\"";
+      for (uint8_t b = 0; b + 3 < pk.length; b += 4) {
+        int32_t v = (int32_t)(((uint32_t)pk.data[b + 3] << 24) | ((uint32_t)pk.data[b + 2] << 16) |
+                              ((uint32_t)pk.data[b + 1] << 8) | pk.data[b]);
+        body += String((long)v);
+        if (b + 4 < pk.length) body += ' ';
+      }
+      body += "\",\"u32_le\":\"";
+      for (uint8_t b = 0; b + 3 < pk.length; b += 4) {
+        uint32_t v = ((uint32_t)pk.data[b + 3] << 24) | ((uint32_t)pk.data[b + 2] << 16) |
+                     ((uint32_t)pk.data[b + 1] << 8) | pk.data[b];
+        body += String((unsigned long)v);
+        if (b + 4 < pk.length) body += ' ';
       }
       body += "\"}";
     }

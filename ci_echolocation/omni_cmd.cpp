@@ -89,11 +89,12 @@ static void cmdHelp(char* out, size_t n, size_t* u) {
          "./omni ble filter <name> - Filter BLE devices\n"
          "./omni ble filter clear - Clear BLE filter\n\n"
          "./omni subghz scan on/off - Start/stop sub-GHz scanning\n"
-         "./omni subghz freq <315|433|868|915> - Set frequency\n"
-         "./omni subghz hop - Enable frequency hopping\n"
+         "./omni subghz freq <315|433|868|915> - Lock RX to one band (no hop)\n"
+         "./omni subghz hop [ms] - Hop 315→433→868→915 (optional OOK dwell ms)\n"
+         "./omni subghz dwell [band] [ms] - Show / set OOK park time per band\n"
          "./omni subghz list - Show sub-GHz packets\n"
-         "./omni subghz raw - Last 10 raw (HEX + protocol/brand ID)\n"
-         "./omni subghz raw <N|last|filter|clear|save|decode|analyze|id|protocols>\n"
+         "./omni subghz raw - Last 10 (all payload formats from firmware)\n"
+         "./omni subghz raw <N|last|formats|all|filter|clear|save|decode|analyze|id|protocols>\n"
          "./omni subghz protocols - Fob/remote brand knowledge base\n\n"
          "./omni lora scan on/off - Start/stop LoRa listening\n"
          "./omni lora freq <868.1|915.0> - Set LoRa frequency\n"
@@ -419,7 +420,7 @@ bool omniHandle(const char* lineIn, char* out, size_t outn) {
       appendf(out, outn, &u, "Sub-GHz scanning: %s\n", on ? "ON" : "OFF");
       return true;
     }
-    if (tokEq(t1, "freq")) {
+    if (tokEq(t1, "freq") || tokEq(t1, "lock") || tokEq(t1, "band")) {
       if (!nextTok(&p, t2, sizeof t2)) {
         append(out, outn, &u, "ERROR: Missing frequency\nValid: 315|433|868|915\n");
         return false;
@@ -430,12 +431,95 @@ bool omniHandle(const char* lineIn, char* out, size_t outn) {
         return false;
       }
       if (gH->setSubghzFreq) gH->setSubghzFreq(mhz);
-      appendf(out, outn, &u, "Sub-GHz frequency set to %.2f MHz\n", mhz);
+      if (gH->setSubghzScan) gH->setSubghzScan(true);
+      appendf(out, outn, &u,
+              "Sub-GHz LOCKED to %.2f MHz (hopping OFF — park for automotive/RKE)\n"
+              "Scanning: ON\n"
+              "To hop again: ./omni subghz hop\n",
+              mhz);
       return true;
     }
     if (tokEq(t1, "hop")) {
+      uint32_t dwell = 0;
+      if (nextTok(&p, t2, sizeof t2) && t2[0]) {
+        // hop 5000  OR  hop dwell 5000
+        if (tokEq(t2, "dwell")) {
+          if (!nextTok(&p, t2, sizeof t2)) {
+            append(out, outn, &u, "ERROR: Usage: ./omni subghz hop [ms]\n");
+            return false;
+          }
+        }
+        dwell = (uint32_t)atol(t2);
+        if (dwell < 100 || dwell > 60000) {
+          append(out, outn, &u, "ERROR: Dwell must be 100–60000 ms\n");
+          return false;
+        }
+        if (gH->setSubghzDwell) gH->setSubghzDwell(0, dwell);
+      }
       if (gH->setSubghzFreq) gH->setSubghzFreq(0);
-      append(out, outn, &u, "Sub-GHz hopping enabled: 315→433→868→915 MHz\n");
+      if (gH->setSubghzScan) gH->setSubghzScan(true);
+      if (dwell) {
+        appendf(out, outn, &u,
+                "Sub-GHz hopping ON: 315→433→868→915 (OOK dwell %lu ms each)\n"
+                "Scanning: ON\n",
+                (unsigned long)dwell);
+      } else {
+        append(out, outn, &u,
+               "Sub-GHz hopping ON: 315→433→868→915 MHz\n"
+               "Scanning: ON\n"
+               "Tip: ./omni subghz hop 5000  — 5s park per band\n"
+               "     ./omni subghz dwell     — show current dwells\n");
+      }
+      return true;
+    }
+    if (tokEq(t1, "dwell") || tokEq(t1, "park")) {
+      // dwell | dwell <ms> | dwell <band> <ms>
+      char t3[32];
+      t3[0] = 0;
+      if (!nextTok(&p, t2, sizeof t2)) {
+        if (gH->subghzDwellStatus) return gH->subghzDwellStatus(out, outn);
+        append(out, outn, &u, "ERROR: dwell status unavailable\n");
+        return false;
+      }
+      float band = 0;
+      uint32_t ms = 0;
+      // If first token looks like a band, second is ms; else first is ms for all
+      float maybeBand = atof(t2);
+      bool looksBand = (maybeBand >= 300 && maybeBand <= 950) ||
+                       tokEq(t2, "315") || tokEq(t2, "433") || tokEq(t2, "868") ||
+                       tokEq(t2, "915") || tokEq(t2, "all");
+      if (looksBand && nextTok(&p, t3, sizeof t3)) {
+        if (tokEq(t2, "all")) band = 0;
+        else band = maybeBand > 0 ? maybeBand : atof(t2);
+        ms = (uint32_t)atol(t3);
+      } else {
+        band = 0;
+        ms = (uint32_t)atol(t2);
+      }
+      if (ms < 100 || ms > 60000) {
+        append(out, outn, &u,
+               "ERROR: Usage: ./omni subghz dwell [<315|433|868|915>] <100-60000 ms>\n");
+        return false;
+      }
+      if (gH->setSubghzDwell) gH->setSubghzDwell(band, ms);
+      if (band >= 300) {
+        appendf(out, outn, &u,
+                "Sub-GHz OOK dwell set: %.0f MHz → %lu ms (FSK auto ~%lu ms)\n",
+                band, (unsigned long)ms, (unsigned long)(ms / 4 < 100 ? 100 : ms / 4));
+      } else {
+        appendf(out, outn, &u,
+                "Sub-GHz OOK dwell set: ALL bands → %lu ms each (FSK auto ~%lu ms)\n"
+                "Hopping will park that long on 315, 433, 868, then 915.\n",
+                (unsigned long)ms, (unsigned long)(ms / 4 < 100 ? 100 : ms / 4));
+      }
+      if (gH->subghzDwellStatus) {
+        char more[512];
+        more[0] = 0;
+        gH->subghzDwellStatus(more, sizeof more);
+        // append table only (skip header noise if long)
+        append(out, outn, &u, "\n");
+        append(out, outn, &u, more);
+      }
       return true;
     }
     if (tokEq(t1, "list")) return gH->subghzList && gH->subghzList(out, outn);

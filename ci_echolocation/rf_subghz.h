@@ -26,6 +26,10 @@ struct SubGhzHit {
 #ifndef ROOT_SUBGHZ_RAW_CAP
 #define ROOT_SUBGHZ_RAW_CAP 2048
 #endif
+/** GDO0 async bit sample period (µs) — packed MSB-first into raw bytes */
+#ifndef ROOT_SUBGHZ_BIT_US
+#define ROOT_SUBGHZ_BIT_US 25
+#endif
 
 struct SubGhzRawPacket {
   uint32_t timestampMs;
@@ -54,6 +58,10 @@ bool subghzHopping();
 bool subghzSetFrequencyMhz(float mhz);
 float subghzCurrentMhz();
 uint32_t subghzPacketCount();
+/** Set OOK dwell (ms) for one band (315/433/868/915) or all if bandMhz≈0. Clamped 100–60000. */
+bool subghzSetOokDwellMs(float bandMhz, uint16_t ms);
+/** Format current per-band OOK/FSK dwell table into out. */
+bool subghzFormatDwell(char* out, size_t n);
 
 /** Raw hex buffer (CC1101 readData when packets land) */
 uint32_t subghzRawCount();
@@ -62,6 +70,7 @@ void subghzRawClear();
 bool subghzRawGet(uint32_t newestIndex, SubGhzRawPacket* out);  // 0 = newest
 size_t subghzRawBytesUsed();
 /** Format last N (1-50) raw packets; args: "", "last", "5", "filter 433.92", "clear",
- *  "save", "decode HEX", "analyze", "id [mhz] [hex]", "protocols" */
+ *  "save", "decode HEX", "analyze", "id [mhz] [hex]", "protocols",
+ *  "formats [N]", "all [N]" — every payload view (HEX/ASCII/BITS/BASE64/DEC/…) */
 bool subghzRawCommand(const char* args, char* out, size_t n);
 bool subghzListRecent(char* out, size_t n);

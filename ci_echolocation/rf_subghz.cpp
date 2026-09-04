@@ -29,8 +29,9 @@ struct ScanSlot {
   uint16_t dwellMs;  // longer on OOK — key fobs are short bursts
   const char* name;
 };
-// Equal OOK energy dwell on 315 / 433.92 / 868 / 915, then short FSK passes.
-static const ScanSlot SLOTS[] = {
+// OOK energy dwell on 315 / 433.92 / 868 / 915, then short FSK passes.
+// dwellMs is mutable via ./omni subghz dwell (automotive park / long listen).
+static ScanSlot SLOTS[] = {
     {315.00f, true, 1100, "315"},
     {433.92f, true, 1100, "433"},
     {868.00f, true, 1100, "868"},
@@ -41,6 +42,14 @@ static const ScanSlot SLOTS[] = {
     {915.00f, false, 200, "915"},
 };
 static const uint8_t SLOT_N = sizeof(SLOTS) / sizeof(SLOTS[0]);
+
+static int bandIndexOok(float mhz) {
+  if (mhz < 1.0f) return -1;  // all
+  if (mhz < 350.0f) return 0;
+  if (mhz < 500.0f) return 1;
+  if (mhz < 900.0f) return 2;
+  return 3;
+}
 
 struct BandCal {
   float noiseEma = -110.0f;
@@ -247,6 +256,70 @@ bool subghzSetFrequencyMhz(float mhz) {
 }
 float subghzCurrentMhz() { return gHopping ? SLOTS[gSlotIdx].mhz : gFixedMhz; }
 uint32_t subghzPacketCount() { return gRawTotal ? gRawTotal : gTotalBursts; }
+
+bool subghzSetOokDwellMs(float bandMhz, uint16_t ms) {
+  if (ms < 100) ms = 100;
+  if (ms > 60000) ms = 60000;
+  const int bi = bandIndexOok(bandMhz);
+  for (uint8_t i = 0; i < SLOT_N; i++) {
+    if (!SLOTS[i].ook) continue;
+    const int si = bandIndexOok(SLOTS[i].mhz);
+    if (bi < 0 || si == bi) SLOTS[i].dwellMs = ms;
+  }
+  // Keep FSK passes short relative to OOK (max 1/4 of OOK, clamp 100–2000ms)
+  uint16_t fsk = (uint16_t)(ms / 4);
+  if (fsk < 100) fsk = 100;
+  if (fsk > 2000) fsk = 2000;
+  for (uint8_t i = 0; i < SLOT_N; i++) {
+    if (SLOTS[i].ook) continue;
+    const int si = bandIndexOok(SLOTS[i].mhz);
+    if (bi < 0 || si == bi) SLOTS[i].dwellMs = fsk;
+  }
+  return true;
+}
+
+bool subghzFormatDwell(char* out, size_t n) {
+  if (!out || n < 32) return false;
+  size_t u = 0;
+  auto ap = [&](const char* s) {
+    size_t l = strlen(s);
+    if (u + l + 1 >= n) l = n > u + 1 ? n - u - 1 : 0;
+    if (l) {
+      memcpy(out + u, s, l);
+      u += l;
+    }
+    out[u] = 0;
+  };
+  auto apf = [&](const char* fmt, ...) {
+    char buf[96];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof buf, fmt, args);
+    va_end(args);
+    ap(buf);
+  };
+  ap("=== SUB-GHZ DWELL ===\n");
+  apf("Mode: %s\n", gHopping ? "HOPPING" : "FIXED");
+  if (!gHopping) apf("Locked: %.2f MHz\n", gFixedMhz);
+  ap("Band   OOK(ms)  FSK(ms)\n");
+  for (uint8_t b = 0; b < 4; b++) {
+    uint16_t ook = 0, fsk = 0;
+    const char* name = "?";
+    for (uint8_t i = 0; i < SLOT_N; i++) {
+      if (bandIndexOok(SLOTS[i].mhz) != (int)b) continue;
+      name = SLOTS[i].name;
+      if (SLOTS[i].ook) ook = SLOTS[i].dwellMs;
+      else fsk = SLOTS[i].dwellMs;
+    }
+    apf("%-5s  %-7u  %u\n", name, (unsigned)ook, (unsigned)fsk);
+  }
+  ap("\nLock one band:  ./omni subghz freq 315|433|868|915\n");
+  ap("Hop all bands:  ./omni subghz hop\n");
+  ap("Set dwell:      ./omni subghz dwell <ms>\n");
+  ap("Per-band:       ./omni subghz dwell <315|433|868|915> <ms>\n");
+  ap("(OOK park time while hopping — use long dwell for automotive RKE)\n");
+  return true;
+}
 
 uint32_t subghzRawCount() { return gRawCount; }
 uint32_t subghzRawTotal() { return gRawTotal; }
@@ -560,12 +633,17 @@ void subghzStatusJson(char* out, size_t n) {
   snprintf(out, n,
            "{\"ready\":true,\"enabled\":%s,\"scan\":\"315,433,868,915\","
            "\"hopping\":%s,\"band\":\"%s\",\"freq_mhz\":%.2f,\"ook\":%s,"
+           "\"dwell_ook_ms\":[%u,%u,%u,%u],\"dwell_fsk_ms\":[%u,%u,%u,%u],"
            "\"rssi\":%d,\"noise_dbm\":%.1f,\"bursts\":%lu,\"raw\":%lu,"
            "\"burst_thresh_db\":%d,\"carrier_thresh_db\":%d}",
            gEnabled ? "true" : "false",
            gHopping ? "true" : "false",
            SLOTS[gSlotIdx].name, subghzCurrentMhz(),
            gCurrentOok ? "true" : "false",
+           (unsigned)SLOTS[0].dwellMs, (unsigned)SLOTS[1].dwellMs,
+           (unsigned)SLOTS[2].dwellMs, (unsigned)SLOTS[3].dwellMs,
+           (unsigned)SLOTS[4].dwellMs, (unsigned)SLOTS[5].dwellMs,
+           (unsigned)SLOTS[6].dwellMs, (unsigned)SLOTS[7].dwellMs,
            (int)gCal[gSlotIdx].peakRssi, gCal[gSlotIdx].noiseEma,
            (unsigned long)gTotalBursts, (unsigned long)gRawTotal,
            (int)ROOT_SUBGHZ_BURST_DB, (int)ROOT_SUBGHZ_CARRIER_DB);
@@ -582,6 +660,208 @@ static void hexAscii(const uint8_t* d, uint8_t len, char* hex, size_t hn, char* 
   }
   hex[hi] = 0;
   asc[ai] = 0;
+}
+
+static void b64Encode(const uint8_t* in, uint8_t n, char* out, size_t outn) {
+  static const char* T =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  size_t o = 0;
+  for (uint8_t i = 0; i < n && o + 4 < outn; i += 3) {
+    uint32_t v = ((uint32_t)in[i]) << 16;
+    if (i + 1 < n) v |= ((uint32_t)in[i + 1]) << 8;
+    if (i + 2 < n) v |= in[i + 2];
+    out[o++] = T[(v >> 18) & 63];
+    out[o++] = T[(v >> 12) & 63];
+    out[o++] = (i + 1 < n) ? T[(v >> 6) & 63] : '=';
+    out[o++] = (i + 2 < n) ? T[v & 63] : '=';
+  }
+  out[o] = 0;
+}
+
+/** Every payload view the backend can produce — no client-side decode needed.
+ *  Bits MSB-first per byte (CC1101 GDO0 sample packing). */
+template <typename ApFn>
+static void appendPayloadViews(ApFn ap, const uint8_t* d, uint8_t len) {
+  char chunk[220];
+  const unsigned bits = (unsigned)len * 8u;
+
+  ap("--- PAYLOAD FORMATS ---\n");
+
+  // HEX spaced
+  ap("HEX: ");
+  for (uint8_t i = 0; i < len; i++) {
+    snprintf(chunk, sizeof chunk, "%02X%s", d[i], i + 1 < len ? " " : "");
+    ap(chunk);
+  }
+  ap("\n");
+
+  // HEX contiguous
+  ap("HEX_CONTIG: ");
+  for (uint8_t i = 0; i < len; i++) {
+    snprintf(chunk, sizeof chunk, "%02X", d[i]);
+    ap(chunk);
+  }
+  ap("\n");
+
+  // Printable ASCII
+  ap("ASCII: \"");
+  for (uint8_t i = 0; i < len; i++) {
+    char c = (d[i] >= 32 && d[i] < 127) ? (char)d[i] : '.';
+    chunk[0] = c;
+    chunk[1] = 0;
+    ap(chunk);
+  }
+  ap("\"\n");
+
+  // UTF-8 view (same printable escape — raw bytes may not be valid UTF-8)
+  ap("UTF8: \"");
+  for (uint8_t i = 0; i < len; i++) {
+    char c = (d[i] >= 32 && d[i] < 127) ? (char)d[i] : '.';
+    chunk[0] = c;
+    chunk[1] = 0;
+    ap(chunk);
+  }
+  ap("\"\n");
+
+  // Base64
+  {
+    char b64[200];
+    b64Encode(d, len, b64, sizeof b64);
+    ap("BASE64: ");
+    ap(b64);
+    ap("\n");
+  }
+
+  // Bits byte-grouped
+  ap("BITS: ");
+  for (uint8_t i = 0; i < len; i++) {
+    char* p = chunk;
+    for (int b = 7; b >= 0; b--) *p++ = ((d[i] >> b) & 1) ? '1' : '0';
+    *p++ = (i + 1 < len) ? ' ' : 0;
+    *p = 0;
+    ap(chunk);
+  }
+  ap("\n");
+
+  // Bits contiguous
+  ap("BITS_CONTIG: ");
+  for (uint8_t i = 0; i < len; i++) {
+    char* p = chunk;
+    for (int b = 7; b >= 0; b--) *p++ = ((d[i] >> b) & 1) ? '1' : '0';
+    *p = 0;
+    ap(chunk);
+  }
+  ap("\n");
+
+  // Nibbles
+  ap("NIBBLES: ");
+  for (uint8_t i = 0; i < len; i++) {
+    snprintf(chunk, sizeof chunk, "%X %X%s", (d[i] >> 4) & 0xF, d[i] & 0xF,
+             i + 1 < len ? " " : "");
+    ap(chunk);
+  }
+  ap("\n");
+
+  // Decimal
+  ap("DEC: ");
+  for (uint8_t i = 0; i < len; i++) {
+    snprintf(chunk, sizeof chunk, "%u%s", (unsigned)d[i], i + 1 < len ? " " : "");
+    ap(chunk);
+  }
+  ap("\n");
+
+  // Octal
+  ap("OCT: ");
+  for (uint8_t i = 0; i < len; i++) {
+    snprintf(chunk, sizeof chunk, "%o%s", (unsigned)d[i], i + 1 < len ? " " : "");
+    ap(chunk);
+  }
+  ap("\n");
+
+  // Signed / unsigned 8-bit
+  ap("S8: ");
+  for (uint8_t i = 0; i < len; i++) {
+    snprintf(chunk, sizeof chunk, "%d%s", (int)(int8_t)d[i], i + 1 < len ? " " : "");
+    ap(chunk);
+  }
+  ap("\n");
+  ap("U8: ");
+  for (uint8_t i = 0; i < len; i++) {
+    snprintf(chunk, sizeof chunk, "%u%s", (unsigned)d[i], i + 1 < len ? " " : "");
+    ap(chunk);
+  }
+  ap("\n");
+
+  // 16-bit BE / LE
+  ap("S16_BE: ");
+  for (uint8_t i = 0; i + 1 < len; i += 2) {
+    int16_t v = (int16_t)(((uint16_t)d[i] << 8) | d[i + 1]);
+    snprintf(chunk, sizeof chunk, "%d%s", (int)v, i + 2 < len ? " " : "");
+    ap(chunk);
+  }
+  ap("\n");
+  ap("U16_BE: ");
+  for (uint8_t i = 0; i + 1 < len; i += 2) {
+    uint16_t v = ((uint16_t)d[i] << 8) | d[i + 1];
+    snprintf(chunk, sizeof chunk, "%u%s", (unsigned)v, i + 2 < len ? " " : "");
+    ap(chunk);
+  }
+  ap("\n");
+  ap("S16_LE: ");
+  for (uint8_t i = 0; i + 1 < len; i += 2) {
+    int16_t v = (int16_t)(((uint16_t)d[i + 1] << 8) | d[i]);
+    snprintf(chunk, sizeof chunk, "%d%s", (int)v, i + 2 < len ? " " : "");
+    ap(chunk);
+  }
+  ap("\n");
+  ap("U16_LE: ");
+  for (uint8_t i = 0; i + 1 < len; i += 2) {
+    uint16_t v = ((uint16_t)d[i + 1] << 8) | d[i];
+    snprintf(chunk, sizeof chunk, "%u%s", (unsigned)v, i + 2 < len ? " " : "");
+    ap(chunk);
+  }
+  ap("\n");
+
+  // 32-bit BE / LE
+  ap("S32_BE: ");
+  for (uint8_t i = 0; i + 3 < len; i += 4) {
+    int32_t v = (int32_t)(((uint32_t)d[i] << 24) | ((uint32_t)d[i + 1] << 16) |
+                          ((uint32_t)d[i + 2] << 8) | d[i + 3]);
+    snprintf(chunk, sizeof chunk, "%ld%s", (long)v, i + 4 < len ? " " : "");
+    ap(chunk);
+  }
+  ap("\n");
+  ap("U32_BE: ");
+  for (uint8_t i = 0; i + 3 < len; i += 4) {
+    uint32_t v = ((uint32_t)d[i] << 24) | ((uint32_t)d[i + 1] << 16) |
+                 ((uint32_t)d[i + 2] << 8) | d[i + 3];
+    snprintf(chunk, sizeof chunk, "%lu%s", (unsigned long)v, i + 4 < len ? " " : "");
+    ap(chunk);
+  }
+  ap("\n");
+  ap("S32_LE: ");
+  for (uint8_t i = 0; i + 3 < len; i += 4) {
+    int32_t v = (int32_t)(((uint32_t)d[i + 3] << 24) | ((uint32_t)d[i + 2] << 16) |
+                          ((uint32_t)d[i + 1] << 8) | d[i]);
+    snprintf(chunk, sizeof chunk, "%ld%s", (long)v, i + 4 < len ? " " : "");
+    ap(chunk);
+  }
+  ap("\n");
+  ap("U32_LE: ");
+  for (uint8_t i = 0; i + 3 < len; i += 4) {
+    uint32_t v = ((uint32_t)d[i + 3] << 24) | ((uint32_t)d[i + 2] << 16) |
+                 ((uint32_t)d[i + 1] << 8) | d[i];
+    snprintf(chunk, sizeof chunk, "%lu%s", (unsigned long)v, i + 4 < len ? " " : "");
+    ap(chunk);
+  }
+  ap("\n");
+
+  snprintf(chunk, sizeof chunk,
+           "BITS_META: %u bytes · %u bits · sample %u us/bit · window ~%u us · "
+           "MSB-first GDO0\n",
+           (unsigned)len, bits, (unsigned)ROOT_SUBGHZ_BIT_US,
+           bits * (unsigned)ROOT_SUBGHZ_BIT_US);
+  ap(chunk);
 }
 
 static void fmtTime(uint32_t ms, char* out, size_t n) {
@@ -623,22 +903,6 @@ static int hexNibble(char c) {
   if (c >= 'a' && c <= 'f') return c - 'a' + 10;
   if (c >= 'A' && c <= 'F') return c - 'A' + 10;
   return -1;
-}
-
-static void b64Encode(const uint8_t* in, uint8_t n, char* out, size_t outn) {
-  static const char* T =
-      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  size_t o = 0;
-  for (uint8_t i = 0; i < n && o + 4 < outn; i += 3) {
-    uint32_t v = ((uint32_t)in[i]) << 16;
-    if (i + 1 < n) v |= ((uint32_t)in[i + 1]) << 8;
-    if (i + 2 < n) v |= in[i + 2];
-    out[o++] = T[(v >> 18) & 63];
-    out[o++] = T[(v >> 12) & 63];
-    out[o++] = (i + 1 < n) ? T[(v >> 6) & 63] : '=';
-    out[o++] = (i + 2 < n) ? T[v & 63] : '=';
-  }
-  out[o] = 0;
 }
 
 static bool buildSaveBlob(char* err, size_t errn) {
@@ -702,7 +966,7 @@ bool subghzRawCommand(const char* args, char* out, size_t n) {
     }
   };
   auto apf = [&](const char* fmt, ...) {
-    char buf[768];
+    char buf[1536];
     va_list a;
     va_start(a, fmt);
     vsnprintf(buf, sizeof buf, fmt, a);
@@ -716,43 +980,45 @@ bool subghzRawCommand(const char* args, char* out, size_t n) {
   auto dumpList = [&](uint32_t want, float filterMhz, bool withGps) {
     uint32_t shown = 0;
     if (filterMhz > 0)
-      apf("=== SUB-GHZ RAW (%.2f MHz, last %lu) ===\n\n", filterMhz, (unsigned long)want);
+      apf("=== SUB-GHZ RAW (%.2f MHz, last %lu) ===\n"
+          "CC1101 GDO0 OOK samples · MSB-first · %u us/bit\n\n",
+          filterMhz, (unsigned long)want, (unsigned)ROOT_SUBGHZ_BIT_US);
     else
-      apf("=== SUB-GHZ RAW (last %lu) ===\n\n", (unsigned long)want);
+      apf("=== SUB-GHZ RAW (last %lu) ===\n"
+          "CC1101 GDO0 OOK samples · MSB-first · %u us/bit\n\n",
+          (unsigned long)want, (unsigned)ROOT_SUBGHZ_BIT_US);
     for (uint32_t i = 0; i < gRawCount && shown < want; i++) {
       SubGhzRawPacket pk;
       if (!subghzRawGet(i, &pk)) break;
       if (filterMhz > 0 && fabsf(pk.frequencyMhz - filterMhz) > 2.0f) continue;
       shown++;
-      // Compact Omni-friendly lines (full hex capped so HTTP/Omni never blanks)
-      const uint8_t showB = pk.length > 24 ? 24 : pk.length;
-      char hex[96];
-      size_t hi = 0;
-      for (uint8_t b = 0; b < showB && hi + 4 < sizeof hex; b++) {
-        hi += (size_t)snprintf(hex + hi, sizeof hex - hi, "%02X%s", pk.data[b],
-                               b + 1 < showB ? " " : "");
-      }
-      if (pk.length > showB && hi + 4 < sizeof hex) {
-        hi += (size_t)snprintf(hex + hi, sizeof hex - hi, " …");
-      }
-      hex[hi] = 0;
       char tbuf[32];
       fmtTime(pk.timestampMs, tbuf, sizeof tbuf);
       if (withGps && pk.gpsValid) {
-        apf("[%lu] %.2f MHz %d dBm %uB @ %.5f,%.5f\nHEX: %s\n",
+        apf("[%lu] %.2f MHz %d dBm %uB (%u bits) @ %.5f,%.5f\n",
             (unsigned long)shown, pk.frequencyMhz, (int)pk.rssi, (unsigned)pk.length,
-            pk.lat, pk.lon, hex);
+            (unsigned)pk.length * 8u, pk.lat, pk.lon);
       } else {
-        apf("[%lu] %.2f MHz %d dBm %uB\nHEX: %s\n",
+        apf("[%lu] %.2f MHz %d dBm %uB (%u bits)\n",
             (unsigned long)shown, pk.frequencyMhz, (int)pk.rssi, (unsigned)pk.length,
-            hex);
+            (unsigned)pk.length * 8u);
       }
+      appendPayloadViews(ap, pk.data, pk.length);
       {
         SgProtoResult pr;
         sgClassify(pk.data, pk.length, pk.frequencyMhz, true, &pr);
         if (pr.decoded && pr.keyHex[0]) {
           apf("ID:  %s (%u%%) · %s · Key %s (%ub)\n", pr.name, (unsigned)pr.confidence,
               pr.family, pr.keyHex, (unsigned)pr.keyBits);
+          if (pr.keyBits) {
+            ap("KEY_BITS: ");
+            for (uint8_t kb = 0; kb < pr.keyBits && kb < 96; kb++) {
+              const uint8_t byte = pr.key[kb / 8];
+              const uint8_t mask = (uint8_t)(1u << (7 - (kb % 8)));
+              ap((byte & mask) ? "1" : "0");
+            }
+            ap("\n");
+          }
         } else {
           apf("ID:  %s (%u%%) · %s · ~%ub TE%uus\n", pr.name, (unsigned)pr.confidence,
               pr.family, (unsigned)pr.bits, (unsigned)pr.teUs);
@@ -797,34 +1063,34 @@ bool subghzRawCommand(const char* args, char* out, size_t n) {
       apf("Status: %s\n", st);
       return false;
     }
-    const uint8_t showB = pk.length > 48 ? 48 : pk.length;
-    char hex[200];
-    size_t hi = 0;
-    for (uint8_t b = 0; b < showB && hi + 4 < sizeof hex; b++) {
-      hi += (size_t)snprintf(hex + hi, sizeof hex - hi, "%02X%s", pk.data[b],
-                             b + 1 < showB ? " " : "");
-    }
-    if (pk.length > showB && hi + 4 < sizeof hex)
-      hi += (size_t)snprintf(hex + hi, sizeof hex - hi, " …");
-    hex[hi] = 0;
-    char asc[64], tbuf[32];
-    size_t ai = 0;
-    for (uint8_t i = 0; i < showB && ai + 1 < sizeof asc; i++) {
-      char c = (pk.data[i] >= 32 && pk.data[i] < 127) ? (char)pk.data[i] : '.';
-      asc[ai++] = c;
-    }
-    asc[ai] = 0;
+    char tbuf[32];
     fmtTime(pk.timestampMs, tbuf, sizeof tbuf);
     ap("=== LAST SUB-GHZ PACKET ===\n");
-    apf("Frequency: %.2f MHz\nRSSI: %d dBm\nLength: %u bytes\n",
-        pk.frequencyMhz, (int)pk.rssi, (unsigned)pk.length);
+    apf("Frequency: %.2f MHz\nRSSI: %d dBm\nLength: %u bytes (%u bits)\n"
+        "Sample: %u us/bit (CC1101 GDO0 async OOK)\n",
+        pk.frequencyMhz, (int)pk.rssi, (unsigned)pk.length, (unsigned)pk.length * 8u,
+        (unsigned)ROOT_SUBGHZ_BIT_US);
     {
       char idbuf[400];
       if (sgFormatIdentify(pk.data, pk.length, pk.frequencyMhz, true, idbuf, sizeof idbuf))
         ap(idbuf);
       ap("\n");
     }
-    apf("HEX: %s\nASCII: %s\nTime: %s\n", hex, asc, tbuf);
+    appendPayloadViews(ap, pk.data, pk.length);
+    {
+      SgProtoResult pr;
+      sgClassify(pk.data, pk.length, pk.frequencyMhz, true, &pr);
+      if (pr.decoded && pr.keyBits) {
+        apf("KEY_HEX: %s\nKEY_BITS: ", pr.keyHex);
+        for (uint8_t kb = 0; kb < pr.keyBits && kb < 96; kb++) {
+          const uint8_t byte = pr.key[kb / 8];
+          const uint8_t mask = (uint8_t)(1u << (7 - (kb % 8)));
+          ap((byte & mask) ? "1" : "0");
+        }
+        ap("\n");
+      }
+    }
+    apf("Time: %s\n", tbuf);
     if (pk.gpsValid) apf("GPS: %.7f, %.7f\n", pk.lat, pk.lon);
     else ap("GPS: (none)\n");
     return true;
@@ -1067,57 +1333,36 @@ bool subghzRawCommand(const char* args, char* out, size_t n) {
       h++;
       bytes[nb++] = (uint8_t)((a << 4) | b);
     }
-    char hex[400], asc[140], b64[160];
-    hexAscii(bytes, nb, hex, sizeof hex, asc, sizeof asc);
-    b64Encode(bytes, nb, b64, sizeof b64);
     apf("=== DECODING: %s ===\n\n", rawIn);
     {
       char idbuf[400];
-      // Assume 433 unless hex came from a tagged capture — caller can use raw id <mhz>
       sgFormatIdentify(bytes, nb, 433.92f, true, idbuf, sizeof idbuf);
       ap("--- PROTOCOL / BRAND ---\n");
       ap(idbuf);
       ap("\n");
     }
-    apf("ASCII: \"%s\"\n", asc);
-    ap("Binary:");
-    for (uint8_t i = 0; i < nb; i++) {
-      ap(" ");
-      for (int bit = 7; bit >= 0; bit--) ap((bytes[i] >> bit) & 1 ? "1" : "0");
+    appendPayloadViews(ap, bytes, nb);
+    return true;
+  }
+
+  // Explicit: dump last packet with every backend format (no client decode)
+  if (strncasecmp(p, "formats", 7) == 0 || strncasecmp(p, "all", 3) == 0) {
+    const char* q = p;
+    while (*q && !isspace((unsigned char)*q)) q++;
+    while (*q && isspace((unsigned char)*q)) q++;
+    uint32_t want = 1;
+    if (*q) {
+      int c = atoi(q);
+      if (c >= 1 && c <= 20) want = (uint32_t)c;
     }
-    ap("\nDecimal:");
-    for (uint8_t i = 0; i < nb; i++) apf(" %u", (unsigned)bytes[i]);
-    apf("\nHex: %s\n", hex);
-    ap("\nPossible formats:\n");
-    apf("- ASCII Text: %s\n", asc);
-    apf("- Base64: %s\n", b64);
-    apf("- UTF-8: %s\n", asc);
-    apf("- HEX: ");
-    for (uint8_t i = 0; i < nb; i++) apf("%02X", bytes[i]);
-    ap("\n- Binary:");
-    for (uint8_t i = 0; i < nb; i++) {
-      ap(" ");
-      for (int bit = 7; bit >= 0; bit--) ap((bytes[i] >> bit) & 1 ? "1" : "0");
+    if (!gRawCount) {
+      ap("ERROR: No raw packets — press a fob, then ./omni subghz raw formats\n");
+      return false;
     }
-    ap("\n- Decimal:");
-    for (uint8_t i = 0; i < nb; i++) apf(" %u", (unsigned)bytes[i]);
-    ap("\n- Octal:");
-    for (uint8_t i = 0; i < nb; i++) apf(" %o", (unsigned)bytes[i]);
-    ap("\n- Signed 8-bit:");
-    for (uint8_t i = 0; i < nb; i++) apf(" %d", (int)(int8_t)bytes[i]);
-    ap("\n- Unsigned 8-bit:");
-    for (uint8_t i = 0; i < nb; i++) apf(" %u", (unsigned)bytes[i]);
-    ap("\n- Signed 16-bit:");
-    for (uint8_t i = 0; i + 1 < nb; i += 2) {
-      int16_t v = (int16_t)(((uint16_t)bytes[i] << 8) | bytes[i + 1]);
-      apf(" %d", (int)v);
-    }
-    ap("\n- Unsigned 16-bit:");
-    for (uint8_t i = 0; i + 1 < nb; i += 2) {
-      uint16_t v = ((uint16_t)bytes[i] << 8) | bytes[i + 1];
-      apf(" %u", (unsigned)v);
-    }
-    ap("\n");
+    apf("=== SUB-GHZ ALL PAYLOAD FORMATS (last %lu) ===\n"
+        "Backend-rendered · no client decode needed\n\n",
+        (unsigned long)want);
+    dumpList(want, 0, true);
     return true;
   }
 
@@ -1136,7 +1381,7 @@ bool subghzRawCommand(const char* args, char* out, size_t n) {
 
   int count = atoi(p);
   if (count < 1 || count > 50) {
-    ap("ERROR: count must be 1-50 (or last|filter|clear|save|decode|analyze|id|protocols)\n");
+    ap("ERROR: count must be 1-50 (or last|formats|all|filter|clear|save|decode|analyze|id|protocols)\n");
     return false;
   }
   dumpList((uint32_t)count, 0, false);
@@ -1160,6 +1405,11 @@ bool subghzHopping() { return false; }
 bool subghzSetFrequencyMhz(float) { return false; }
 float subghzCurrentMhz() { return 0; }
 uint32_t subghzPacketCount() { return 0; }
+bool subghzSetOokDwellMs(float, uint16_t) { return false; }
+bool subghzFormatDwell(char* out, size_t n) {
+  if (out && n) snprintf(out, n, "ERROR: Sub-GHz disabled\n");
+  return false;
+}
 uint32_t subghzRawCount() { return 0; }
 uint32_t subghzRawTotal() { return 0; }
 size_t subghzRawBytesUsed() { return 0; }
