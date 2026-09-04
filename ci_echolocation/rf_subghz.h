@@ -61,6 +61,7 @@ uint32_t subghzRawTotal();
 void subghzRawClear();
 bool subghzRawGet(uint32_t newestIndex, SubGhzRawPacket* out);  // 0 = newest
 size_t subghzRawBytesUsed();
-/** Format last N (1-50) raw packets; args: "", "last", "5", "filter 433.92", "clear", "save", "decode HEX", "analyze" */
+/** Format last N (1-50) raw packets; args: "", "last", "5", "filter 433.92", "clear",
+ *  "save", "decode HEX", "analyze", "id [mhz] [hex]", "protocols" */
 bool subghzRawCommand(const char* args, char* out, size_t n);
 bool subghzListRecent(char* out, size_t n);

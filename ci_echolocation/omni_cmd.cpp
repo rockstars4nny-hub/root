@@ -92,8 +92,9 @@ static void cmdHelp(char* out, size_t n, size_t* u) {
          "./omni subghz freq <315|433|868|915> - Set frequency\n"
          "./omni subghz hop - Enable frequency hopping\n"
          "./omni subghz list - Show sub-GHz packets\n"
-         "./omni subghz raw - Last 10 raw packets (HEX/ASCII/GPS)\n"
-         "./omni subghz raw <N|last|filter|clear|save|decode|analyze>\n\n"
+         "./omni subghz raw - Last 10 raw (HEX + protocol/brand ID)\n"
+         "./omni subghz raw <N|last|filter|clear|save|decode|analyze|id|protocols>\n"
+         "./omni subghz protocols - Fob/remote brand knowledge base\n\n"
          "./omni lora scan on/off - Start/stop LoRa listening\n"
          "./omni lora freq <868.1|915.0> - Set LoRa frequency\n"
          "./omni lora list - Show LoRa packets\n\n"
@@ -104,8 +105,10 @@ static void cmdHelp(char* out, size_t n, size_t* u) {
          "./omni lr send <message> - Send LR message\n"
          "./omni lr test - Test LR connection\n\n"
          "./omni ap status - Show AP status\n"
-         "./omni ap on - Enable AP mode\n"
-         "./omni ap off - Disable AP mode\n"
+         "./omni ap on - Start SoftAP if down\n"
+         "./omni ap start - Same as ap on (bring SoftAP up)\n"
+         "./omni ap restart - Force SoftAP re-beacon\n"
+         "./omni ap off - (blocked — would drop dashboard)\n"
          "./omni ap ssid <name> - Change AP SSID\n\n"
          "./omni log status - Show logging status\n"
          "./omni log dump - Dump current log\n"
@@ -131,7 +134,7 @@ static void cmdStart(char* out, size_t n, size_t* u) {
                  : "BLE: OFF — ./omni ble scan on\n");
   if (s.subghzOn) {
     if (s.subghzHopping)
-      append(out, n, u, "Sub-GHz: Hopping 315→433→868 MHz\n");
+      append(out, n, u, "Sub-GHz: Hopping 315→433→868→915 MHz\n");
     else
       appendf(out, n, u, "Sub-GHz: Fixed %.2f MHz\n", s.subghzFreqMhz);
   } else {
@@ -432,10 +435,13 @@ bool omniHandle(const char* lineIn, char* out, size_t outn) {
     }
     if (tokEq(t1, "hop")) {
       if (gH->setSubghzFreq) gH->setSubghzFreq(0);
-      append(out, outn, &u, "Sub-GHz hopping enabled: 315→433→868 MHz\n");
+      append(out, outn, &u, "Sub-GHz hopping enabled: 315→433→868→915 MHz\n");
       return true;
     }
     if (tokEq(t1, "list")) return gH->subghzList && gH->subghzList(out, outn);
+    if (tokEq(t1, "protocols") || tokEq(t1, "brands")) {
+      return gH->subghzRaw && gH->subghzRaw("protocols", out, outn);
+    }
     if (tokEq(t1, "raw")) {
       // rest of line is args
       skipWs(&p);
@@ -570,15 +576,34 @@ bool omniHandle(const char* lineIn, char* out, size_t outn) {
       return true;
     }
     }
-    if (tokEq(t1, "on")) {
+    if (tokEq(t1, "on") || tokEq(t1, "start") || tokEq(t1, "up") ||
+        tokEq(t1, "restart") || tokEq(t1, "reboot")) {
+      const bool force = tokEq(t1, "restart") || tokEq(t1, "reboot");
+      OmniSnapshot before = gH->snapshot();
+      if (!force && before.apOn) {
+        appendf(out, outn, &u,
+                "AP already ACTIVE\nSSID: %s\nIP: %s\n"
+                "Use \"./omni ap restart\" to force re-beacon\n",
+                before.apSsid, before.apIp);
+        return true;
+      }
+      append(out, outn, &u, force ? "SoftAP restarting...\n" : "SoftAP starting...\n");
       if (gH->setAp) gH->setAp(true);
       OmniSnapshot s = gH->snapshot();
-      appendf(out, outn, &u, "AP mode: ON\nSSID: %s\nIP: %s\n", s.apSsid, s.apIp);
-      return true;
+      if (s.apOn) {
+        appendf(out, outn, &u,
+                "AP mode: ON\nSSID: %s\nPass: (see firmware ROOT_AP_PASS)\n"
+                "IP: %s\nChannel home: %u\nJoin Wi‑Fi then open http://%s/\n",
+                s.apSsid, s.apIp, (unsigned)s.apChannel, s.apIp);
+      } else {
+        append(out, outn, &u, "ERROR: SoftAP failed to start — check Serial log\n");
+      }
+      return s.apOn;
     }
     if (tokEq(t1, "off")) {
       append(out, outn, &u,
-             "ERROR: SoftAP off would drop this session — keep AP on for dashboard\n");
+             "ERROR: SoftAP off would drop this session — keep AP on for dashboard\n"
+             "If beacons are dead, use \"./omni ap restart\" instead\n");
       return false;
     }
     if (tokEq(t1, "ssid")) {

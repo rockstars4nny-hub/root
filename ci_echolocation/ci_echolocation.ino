@@ -845,6 +845,8 @@ static void lockApChannel();
 static void setChannelManual(uint8_t ch, bool hop);
 static bool bringUpSoftAp();
 static bool softApAlive();
+static bool restartSoftAp(const char* reason);
+static void armPromiscuous();
 static void serviceSoftAp(uint32_t now);
 
 static void lockApChannel() {
@@ -973,14 +975,17 @@ static bool omniSetLoraFreq(float mhz) {
 }
 static bool omniGpsReset() { return true; }
 static bool omniSetAp(bool on) {
-  (void)on;
-  return true;
+  if (!on) {
+    // SoftAP off would lose Serial-over-WiFi / dashboard — refuse silently for hook
+    return false;
+  }
+  return restartSoftAp("omni ap on");
 }
 static bool omniSetApSsid(const char* ssid) {
   if (!ssid || !ssid[0]) return false;
   strncpy(gApSsidBuf, ssid, sizeof gApSsidBuf - 1);
-  bringUpSoftAp();
-  return true;
+  gApSsidBuf[sizeof gApSsidBuf - 1] = 0;
+  return restartSoftAp("omni ap ssid");
 }
 static bool omniSetLrPeer(const char* mac) {
   if (!mac) return false;
@@ -1342,7 +1347,48 @@ static bool softApAlive() {
   if (esp_wifi_get_mode(&mode) != ESP_OK) return false;
   if (mode != WIFI_MODE_AP && mode != WIFI_MODE_APSTA) return false;
   if (WiFi.softAPIP() == IPAddress(0, 0, 0, 0)) return false;
+  // softAPSSID empty ⇒ radio thinks AP is dead even if mode bit stuck
+  String ssid = WiFi.softAPSSID();
+  if (!ssid.length()) return false;
   return true;
+}
+
+static bool restartSoftAp(const char* reason) {
+  Serial.printf("root: SoftAP restart (%s)\n", reason ? reason : "manual");
+  const bool hadPromisc = !gPromiscDeferred;
+  esp_wifi_set_promiscuous(false);
+  delay(30);
+
+  const bool ok = bringUpSoftAp();
+  WiFi.softAPmacAddress(gApMac);
+  excludeMacAdd(gApMac);
+  gDns.stop();
+  if (ok) gDns.start(53, "*", WiFi.softAPIP());
+
+  gChannel = AP_CHANNEL;
+  gHopEnable = true;
+  gLastHopMs = millis();
+  gSoftApUp = ok;
+
+  if (ok && hadPromisc) {
+    armPromiscuous();
+    wifiLrInit();
+  }
+#if ROOT_ENABLE_BLE
+  if (ok && gBleScanIntent && bleReady()) {
+    WiFi.setSleep(true);
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+  }
+#endif
+
+  if (ok) {
+    Serial.printf("root: SoftAP UP '%s' → http://%s (pass %s)\n",
+                  WiFi.softAPSSID().c_str(),
+                  WiFi.softAPIP().toString().c_str(), AP_PASS);
+  } else {
+    Serial.println("root: SoftAP restart FAILED");
+  }
+  return ok;
 }
 
 static void configureApRadio() {
@@ -1483,16 +1529,13 @@ static void serviceSoftAp(uint32_t now) {
     Serial.println("root: promiscuous + ESP-NOW armed");
   }
 
-  if (now - gLastApCheckMs < 4000) return;
+  if (now - gLastApCheckMs < 2000) return;
   gLastApCheckMs = now;
   gSoftApUp = softApAlive();
   if (gSoftApUp) return;
 
-  Serial.println("root: SoftAP down — restarting");
-  bringUpSoftAp();
-  WiFi.softAPmacAddress(gApMac);
-  gHopEnable = true;
-  if (!gPromiscDeferred) armPromiscuous();
+  Serial.println("root: SoftAP down — auto-restart");
+  restartSoftAp("watchdog");
 }
 
 static void startWeb() {
@@ -1735,6 +1778,33 @@ static void startWeb() {
     req->send(200, "application/json", body);
   });
 
+  // SoftAP start/restart when beacons die (also: ./omni ap start|restart · Serial: ap start)
+  gServer.on("/api/ap", HTTP_GET, [](AsyncWebServerRequest* req) {
+    String action = "status";
+    if (req->hasParam("action")) action = req->getParam("action")->value();
+    action.toLowerCase();
+    bool did = false;
+    bool ok = softApAlive();
+    if (action == "start" || action == "on" || action == "up") {
+      if (!ok) {
+        ok = restartSoftAp("api ap start");
+        did = true;
+      }
+    } else if (action == "restart" || action == "reboot" || action == "refresh") {
+      ok = restartSoftAp("api ap restart");
+      did = true;
+    }
+    char buf[256];
+    snprintf(buf, sizeof buf,
+             "{\"ok\":%s,\"action\":\"%s\",\"restarted\":%s,\"ssid\":\"%s\","
+             "\"ip\":\"%s\",\"channel\":%u,\"clients\":%u,\"hopping\":%s}",
+             ok ? "true" : "false", action.c_str(), did ? "true" : "false",
+             WiFi.softAPSSID().c_str(), WiFi.softAPIP().toString().c_str(),
+             (unsigned)gChannel, (unsigned)WiFi.softAPgetStationNum(),
+             gHopEnable ? "true" : "false");
+    req->send(ok ? 200 : 503, "application/json", buf);
+  });
+
   gServer.on("/api/omni", HTTP_GET, [](AsyncWebServerRequest* req) {
     String held = "./omni status";
     if (req->hasParam("cmd")) held = req->getParam("cmd")->value();
@@ -1804,7 +1874,7 @@ void setup() {
   strncpy(gApSsidBuf, ROOT_AP_SSID, sizeof gApSsidBuf - 1);
   omniSetupHooks();
   Serial.println("root: OmniScan ./omni commands ready (Serial + /api/omni)");
-  Serial.println("root: GET /api/export · GET /api/subghz/raw?n=20");
+  Serial.println("root: GET /api/export · /api/subghz/raw · /api/ap?action=start");
 
   sightInit();
   gDev = new DevMap();
@@ -1845,10 +1915,23 @@ static void serviceSerialCmds() {
       if (strncmp(line, "./omni", 6) == 0 || strncmp(line, "omni", 4) == 0 ||
           strcmp(line, "s") == 0 || strcmp(line, "h") == 0 || strcmp(line, "d") == 0 ||
           strncmp(line, "ch ", 3) == 0 || strcmp(line, "start") == 0 ||
-          strcmp(line, "stop") == 0) {
+          strcmp(line, "stop") == 0 ||
+          strcmp(line, "ap") == 0 || strncmp(line, "ap ", 3) == 0 ||
+          strcmp(line, "apstart") == 0 || strcmp(line, "aprestart") == 0) {
         char* out = omniOutBuf();
         if (!out) continue;
-        omniHandle(line, out, gOmniOutCap);
+        // Short Serial aliases → full ./omni ap …
+        char cmd[96];
+        if (strcmp(line, "ap") == 0 || strcmp(line, "apstart") == 0) {
+          snprintf(cmd, sizeof cmd, "./omni ap start");
+        } else if (strcmp(line, "aprestart") == 0 || strcmp(line, "ap restart") == 0) {
+          snprintf(cmd, sizeof cmd, "./omni ap restart");
+        } else if (strncmp(line, "ap ", 3) == 0) {
+          snprintf(cmd, sizeof cmd, "./omni %s", line);
+        } else {
+          snprintf(cmd, sizeof cmd, "%s", line);
+        }
+        omniHandle(cmd, out, gOmniOutCap);
         Serial.print(out);
         continue;
       }
@@ -1879,7 +1962,7 @@ static void serviceSerialCmds() {
         loraStatusJson(lo, sizeof lo);
         Serial.printf("root rf: {\"subghz\":%s,\"lora\":%s}\n", sg, lo);
       } else if (strcmp(line, "help") == 0) {
-        Serial.println("root cmds: status | rf | hop auto | hop <1-11> | ./omni …");
+        Serial.println("root cmds: status | rf | hop auto | hop <1-11> | ap start | ap restart | ./omni …");
         char* out = omniOutBuf();
         if (out) {
           omniHandle("./omni system help", out, gOmniOutCap);

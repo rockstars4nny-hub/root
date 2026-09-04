@@ -830,7 +830,7 @@ function kindExplain(k){
 function bandExplain(b){
   const m={
     wifi:"2.4 GHz Wi-Fi (passive promiscuous). Listen-only — no transmit.",
-    subghz:"CC1101: 315/433/868 OOK+FSK energy scan — remotes, sensors, carriers.",
+    subghz:"CC1101: 315/433/868/915 OOK+FSK energy scan — remotes, sensors, carriers.",
     lora:"E22 transparent UART @ 915 MHz — real payloads only (noise filtered)."
   };
   return m[b]||"RF band this hit was sorted into.";

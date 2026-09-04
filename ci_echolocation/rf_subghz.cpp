@@ -1,4 +1,5 @@
 #include "rf_subghz.h"
+#include "rf_subghz_proto.h"
 #include "root_config.h"
 
 #if ROOT_ENABLE_SUBGHZ
@@ -28,15 +29,16 @@ struct ScanSlot {
   uint16_t dwellMs;  // longer on OOK — key fobs are short bursts
   const char* name;
 };
-// Equal OOK energy dwell on 315 / 433.92 / 868 — remotes live on all three.
-// Short FSK passes after; 915 stays on the E22 LoRa path (not starved here).
+// Equal OOK energy dwell on 315 / 433.92 / 868 / 915, then short FSK passes.
 static const ScanSlot SLOTS[] = {
-    {315.00f, true, 1200, "315"},
-    {433.92f, true, 1200, "433"},
-    {868.00f, true, 1200, "868"},
-    {315.00f, false, 220, "315"},
-    {433.92f, false, 220, "433"},
-    {868.00f, false, 220, "868"},
+    {315.00f, true, 1100, "315"},
+    {433.92f, true, 1100, "433"},
+    {868.00f, true, 1100, "868"},
+    {915.00f, true, 1100, "915"},
+    {315.00f, false, 200, "315"},
+    {433.92f, false, 200, "433"},
+    {868.00f, false, 200, "868"},
+    {915.00f, false, 200, "915"},
 };
 static const uint8_t SLOT_N = sizeof(SLOTS) / sizeof(SLOTS[0]);
 
@@ -111,16 +113,25 @@ static void synthMacFromPayload(uint8_t* mac, uint32_t freqKhz, const uint8_t* d
   if (mac[5] < 4) mac[5] |= 0x10;
 }
 
-static void labelHit(SubGhzHit& h, bool ook) {
+static void labelHit(SubGhzHit& h, bool ook, const SgProtoResult* proto) {
   const float mhz = h.freqKhz / 1000.0f;
   const int above = (int)h.rssi - (int)h.noiseFloor;
   const char* mode = ook ? "OOK" : "FSK";
-  const char* kind =
-      h.detect == SG_CARRIER ? "carrier" : h.detect == SG_PACKET ? "packet" : "burst";
-  snprintf(h.label, sizeof(h.label), "%.2f %s %s %ddBm", mhz, mode, kind, (int)h.rssi);
+  if (proto && proto->summary[0]) {
+    // Prefer protocol/brand summary (fits device ssid ≤32)
+    snprintf(h.label, sizeof(h.label), "%s", proto->summary);
+  } else {
+    const char* kind =
+        h.detect == SG_CARRIER ? "carrier" : h.detect == SG_PACKET ? "packet" : "burst";
+    snprintf(h.label, sizeof(h.label), "%.2f %s %s %ddBm", mhz, mode, kind, (int)h.rssi);
+  }
   if (!h.detail[0]) {
-    snprintf(h.detail, sizeof(h.detail), "nf %d | %+ddB | %s", (int)h.noiseFloor, above,
-             mode);
+    if (proto && proto->detail[0]) {
+      snprintf(h.detail, sizeof(h.detail), "%s", proto->detail);
+    } else {
+      snprintf(h.detail, sizeof(h.detail), "nf %d | %+ddB | %s", (int)h.noiseFloor, above,
+               mode);
+    }
   }
 }
 
@@ -156,8 +167,8 @@ static void configureSlot(const ScanSlot& sl) {
     gRadio->setBitRate(4.8f);
     gRadio->setFrequencyDeviation(25.0f);
   } else {
-    // 868 FSK
-    gRadio->setRxBandwidth(203.0f);
+    // 868 / 915 FSK
+    gRadio->setRxBandwidth(sl.mhz >= 900.0f ? 162.0f : 203.0f);
     gRadio->setBitRate(4.8f);
     gRadio->setFrequencyDeviation(45.0f);
   }
@@ -167,11 +178,11 @@ static void configureSlot(const ScanSlot& sl) {
 }
 
 static void configureBand(float mhz) {
-  ScanSlot sl = {mhz, true, 1200, "fix"};
-  if (mhz >= 800.0f && mhz < 900.0f) sl = {868.0f, true, 1200, "868"};
-  else if (mhz >= 900.0f) sl = {915.0f, false, 400, "915"};
-  else if (mhz < 350.0f) sl = {315.0f, true, 1200, "315"};
-  else sl = {433.92f, true, 1200, "433"};
+  ScanSlot sl = {mhz, true, 1100, "fix"};
+  if (mhz >= 800.0f && mhz < 900.0f) sl = {868.0f, true, 1100, "868"};
+  else if (mhz >= 900.0f) sl = {915.0f, true, 1100, "915"};
+  else if (mhz < 350.0f) sl = {315.0f, true, 1100, "315"};
+  else sl = {433.92f, true, 1100, "433"};
   configureSlot(sl);
 }
 
@@ -311,7 +322,7 @@ void subghzInit() {
   int8_t r0 = readRssiDbm();
   delay(2);
   int8_t r1 = readRssiDbm();
-  Serial.printf("root: CC1101 OK · OOK energy 315/433/868 (1.2s each) + FSK · "
+  Serial.printf("root: CC1101 OK · OOK energy 315/433/868/915 (1.1s each) + FSK · "
                 "RSSI now %d/%d dBm (CS=%d GDO0=%d)\n",
                 (int)r0, (int)r1, ROOT_CC1101_CS, ROOT_CC1101_GDO0);
 }
@@ -333,8 +344,8 @@ static void emit(BandCal& c, uint8_t si, uint32_t freqKhz, int8_t rssi,
   if (gCurrentOok || det == SG_BURST) {
     uint8_t acc = 0;
     uint8_t bit = 0;
-    // ~50 µs/bit ≈ 20 kbaud · 64 bytes ≈ 25 ms of airtime
-    const size_t wantBits = 64 * 8;
+    // ROOT_SUBGHZ_BIT_US per sample — finer TE for PWM/Manchester decode
+    const size_t wantBits = (size_t)ROOT_SUBGHZ_RAW_BYTES * 8;
     for (size_t i = 0; i < wantBits && rawLen < ROOT_SUBGHZ_RAW_BYTES; i++) {
       if (digitalRead(ROOT_CC1101_GDO0)) acc |= (uint8_t)(1u << (7 - bit));
       if (++bit >= 8) {
@@ -342,7 +353,7 @@ static void emit(BandCal& c, uint8_t si, uint32_t freqKhz, int8_t rssi,
         acc = 0;
         bit = 0;
       }
-      delayMicroseconds(50);
+      delayMicroseconds(ROOT_SUBGHZ_BIT_US);
     }
   }
 
@@ -352,40 +363,66 @@ static void emit(BandCal& c, uint8_t si, uint32_t freqKhz, int8_t rssi,
   h.noiseFloor = floor;
   h.detect = det;
   strncpy(h.band, SLOTS[si].name, sizeof h.band - 1);
+
+  SgProtoResult proto = {};
+  bool haveProto = false;
   if (rawLen) {
+    haveProto = sgClassify(raw, rawLen, SLOTS[si].mhz, gCurrentOok, &proto);
     synthMacFromPayload(h.mac, freqKhz, raw, rawLen);
     pushRaw(SLOTS[si].mhz, rssi, 0, raw, rawLen);
-    size_t di = 0;
-    di += (size_t)snprintf(h.detail + di, sizeof(h.detail) - di, "%uB ",
-                           (unsigned)rawLen);
-    for (uint8_t i = 0; i < rawLen && di + 3 < sizeof(h.detail); i++) {
-      di += (size_t)snprintf(h.detail + di, sizeof(h.detail) - di, "%02X", raw[i]);
-      if (i + 1 < rawLen && di + 1 < sizeof(h.detail) && i < 15) h.detail[di++] = ' ';
-      if (i >= 15) {
-        if (di + 3 < sizeof(h.detail)) {
-          h.detail[di++] = '.';
-          h.detail[di++] = '.';
-          h.detail[di] = 0;
+    // detail: protocol line preferred; keep short hex if unknown
+    if (haveProto && proto.id != SG_PROTO_UNKNOWN && proto.id != SG_PROTO_NOISE) {
+      snprintf(h.detail, sizeof(h.detail), "%s", proto.detail);
+    } else {
+      size_t di = 0;
+      di += (size_t)snprintf(h.detail + di, sizeof(h.detail) - di, "%uB ",
+                             (unsigned)rawLen);
+      for (uint8_t i = 0; i < rawLen && di + 3 < sizeof(h.detail); i++) {
+        di += (size_t)snprintf(h.detail + di, sizeof(h.detail) - di, "%02X", raw[i]);
+        if (i + 1 < rawLen && di + 1 < sizeof(h.detail) && i < 15) h.detail[di++] = ' ';
+        if (i >= 15) {
+          if (di + 3 < sizeof(h.detail)) {
+            h.detail[di++] = '.';
+            h.detail[di++] = '.';
+            h.detail[di] = 0;
+          }
+          break;
         }
-        break;
       }
     }
   } else {
     synthMac(h.mac, freqKhz, det, rssi);
-    snprintf(h.detail, sizeof(h.detail), "nf %d | %+ddB | %s", (int)floor, delta,
+    // Energy-only: band prior still useful for the device list label
+    haveProto = sgClassify(nullptr, 0, SLOTS[si].mhz, gCurrentOok, &proto);
+    if (gCurrentOok && (SLOTS[si].mhz < 360.0f ||
+                        (SLOTS[si].mhz > 400.0f && SLOTS[si].mhz < 500.0f) ||
+                        (SLOTS[si].mhz >= 800.0f && SLOTS[si].mhz < 920.0f))) {
+      // Prefer auto/gate wording over bare "Unknown" when we only saw energy
+      snprintf(proto.summary, sizeof proto.summary, "%s OOK remote?",
+               SLOTS[si].mhz >= 900 ? "915" : SLOTS[si].mhz >= 800 ? "868"
+                                           : SLOTS[si].mhz >= 400  ? "433"
+                                                                   : "315");
+      proto.name = "OOK burst";
+      proto.brands = "key fob · gate · garage · sensor (press again for ID)";
+      proto.family = "unknown";
+      snprintf(proto.detail, sizeof proto.detail, "energy only · mash fob for bits");
+      haveProto = true;
+    }
+    snprintf(h.detail, sizeof(h.detail), "nf %d | %+ddB | %s energy", (int)floor, delta,
              gCurrentOok ? "OOK" : "FSK");
   }
-  labelHit(h, gCurrentOok);
+  labelHit(h, gCurrentOok, haveProto ? &proto : nullptr);
   pushHit(h);
   c.lastHitMs = now;
   c.lastEmitMs = now;
   c.bursts++;
   gTotalBursts++;
 
-  Serial.printf("root: subghz HIT %.2f %s %s peak=%d nf=%d (+%d) hex=%s\n",
+  Serial.printf("root: subghz HIT %.2f %s %s peak=%d nf=%d (+%d) proto=%s hex=%s\n",
                 SLOTS[si].mhz, gCurrentOok ? "OOK" : "FSK",
                 det == SG_CARRIER ? "carrier" : det == SG_PACKET ? "packet" : "burst",
-                (int)rssi, (int)floor, delta, h.detail);
+                (int)rssi, (int)floor, delta,
+                haveProto && proto.name ? proto.name : "?", h.detail);
 }
 
 static void sampleBand(uint8_t si, uint32_t nowMs) {
@@ -521,7 +558,7 @@ bool subghzPopActivity(SubGhzHit* out) {
 void subghzStatusJson(char* out, size_t n) {
   if (!out || n < 8) return;
   snprintf(out, n,
-           "{\"ready\":true,\"enabled\":%s,\"scan\":\"315,433,868\","
+           "{\"ready\":true,\"enabled\":%s,\"scan\":\"315,433,868,915\","
            "\"hopping\":%s,\"band\":\"%s\",\"freq_mhz\":%.2f,\"ook\":%s,"
            "\"rssi\":%d,\"noise_dbm\":%.1f,\"bursts\":%lu,\"raw\":%lu,"
            "\"burst_thresh_db\":%d,\"carrier_thresh_db\":%d}",
@@ -702,18 +739,31 @@ bool subghzRawCommand(const char* args, char* out, size_t n) {
       char tbuf[32];
       fmtTime(pk.timestampMs, tbuf, sizeof tbuf);
       if (withGps && pk.gpsValid) {
-        apf("[%lu] %.2f MHz %d dBm %uB @ %.5f,%.5f\nHEX: %s\nTime: %s\n\n",
+        apf("[%lu] %.2f MHz %d dBm %uB @ %.5f,%.5f\nHEX: %s\n",
             (unsigned long)shown, pk.frequencyMhz, (int)pk.rssi, (unsigned)pk.length,
-            pk.lat, pk.lon, hex, tbuf);
+            pk.lat, pk.lon, hex);
       } else {
-        apf("[%lu] %.2f MHz %d dBm %uB\nHEX: %s\nTime: %s\n\n",
+        apf("[%lu] %.2f MHz %d dBm %uB\nHEX: %s\n",
             (unsigned long)shown, pk.frequencyMhz, (int)pk.rssi, (unsigned)pk.length,
-            hex, tbuf);
+            hex);
       }
+      {
+        SgProtoResult pr;
+        sgClassify(pk.data, pk.length, pk.frequencyMhz, true, &pr);
+        if (pr.decoded && pr.keyHex[0]) {
+          apf("ID:  %s (%u%%) · %s · Key %s (%ub)\n", pr.name, (unsigned)pr.confidence,
+              pr.family, pr.keyHex, (unsigned)pr.keyBits);
+        } else {
+          apf("ID:  %s (%u%%) · %s · ~%ub TE%uus\n", pr.name, (unsigned)pr.confidence,
+              pr.family, (unsigned)pr.bits, (unsigned)pr.teUs);
+        }
+        apf("     %s\n", pr.brands);
+      }
+      apf("Time: %s\n\n", tbuf);
     }
     if (!shown) {
       ap("(no raw captures yet)\n");
-      ap("Press a 315/433/868 remote near the board, then run again.\n");
+      ap("Press a 315/433/868/915 remote near the board, then run again.\n");
       ap("Also try: GET http://192.168.4.1/api/subghz/raw?n=20\n");
     }
     return shown;
@@ -768,9 +818,73 @@ bool subghzRawCommand(const char* args, char* out, size_t n) {
     ap("=== LAST SUB-GHZ PACKET ===\n");
     apf("Frequency: %.2f MHz\nRSSI: %d dBm\nLength: %u bytes\n",
         pk.frequencyMhz, (int)pk.rssi, (unsigned)pk.length);
+    {
+      char idbuf[400];
+      if (sgFormatIdentify(pk.data, pk.length, pk.frequencyMhz, true, idbuf, sizeof idbuf))
+        ap(idbuf);
+      ap("\n");
+    }
     apf("HEX: %s\nASCII: %s\nTime: %s\n", hex, asc, tbuf);
     if (pk.gpsValid) apf("GPS: %.7f, %.7f\n", pk.lat, pk.lon);
     else ap("GPS: (none)\n");
+    return true;
+  }
+
+  if (strncasecmp(p, "protocols", 9) == 0) {
+    return sgProtoCatalog(out, n);
+  }
+
+  if (strncasecmp(p, "id", 2) == 0 && (p[2] == 0 || isspace((unsigned char)p[2]))) {
+    p += 2;
+    while (*p && isspace((unsigned char)*p)) p++;
+    uint8_t bytes[96];
+    uint8_t nb = 0;
+    float mhz = 433.92f;
+    if (*p) {
+      // optional leading freq: id 315 FE00...  OR just hex
+      if ((*p >= '0' && *p <= '9') || *p == '.') {
+        char* end = nullptr;
+        float f = strtof(p, &end);
+        if (end && end != p && f > 100.0f) {
+          mhz = f;
+          p = end;
+          while (*p && isspace((unsigned char)*p)) p++;
+        }
+      }
+      const char* h = p;
+      while (*h && nb < 96) {
+        while (*h && (isspace((unsigned char)*h) || *h == ':' || *h == '-')) h++;
+        if (!*h) break;
+        int a = hexNibble(*h++);
+        if (a < 0) break;
+        int b = hexNibble(*h);
+        if (b < 0) {
+          bytes[nb++] = (uint8_t)a;
+          break;
+        }
+        h++;
+        bytes[nb++] = (uint8_t)((a << 4) | b);
+      }
+      if (!nb) {
+        ap("ERROR: Usage: ./omni subghz raw id [mhz] <hex>\n"
+           "       ./omni subghz raw id          (last packet)\n");
+        return false;
+      }
+    } else {
+      SubGhzRawPacket pk;
+      if (!subghzRawGet(0, &pk)) {
+        ap("ERROR: No raw packets — press a fob, then ./omni subghz raw id\n");
+        return false;
+      }
+      memcpy(bytes, pk.data, pk.length < 96 ? pk.length : 96);
+      nb = pk.length < 96 ? pk.length : 96;
+      mhz = pk.frequencyMhz;
+      apf("=== SUB-GHZ IDENTIFY (last @ %.2f MHz) ===\n", mhz);
+    }
+    if (!out[0]) ap("=== SUB-GHZ IDENTIFY ===\n");
+    char idbuf[400];
+    sgFormatIdentify(bytes, nb, mhz, true, idbuf, sizeof idbuf);
+    ap(idbuf);
     return true;
   }
 
@@ -810,6 +924,7 @@ bool subghzRawCommand(const char* args, char* out, size_t n) {
       bool used;
     } pats[32] = {};
     uint32_t uniqueish = 0;
+    uint32_t protoCount[SG_PROTO_COUNT] = {};
 
     for (uint32_t i = 0; i < gRawCount; i++) {
       SubGhzRawPacket pk;
@@ -840,11 +955,25 @@ bool subghzRawCommand(const char* args, char* out, size_t n) {
         pats[slot].count = 1;
         uniqueish++;
       }
+      SgProtoResult pr;
+      sgClassify(pk.data, pk.length, pk.frequencyMhz, true, &pr);
+      if ((uint8_t)pr.id < SG_PROTO_COUNT) protoCount[pr.id]++;
     }
     uint32_t buffered = gRawCount;
     ap("=== SUB-GHZ RAW ANALYSIS ===\n\n");
-    apf("Total Packets: %lu\nUnique Patterns: %lu\nMost Common Patterns:\n",
-        (unsigned long)gRawTotal, (unsigned long)uniqueish);
+    apf("Total Packets: %lu\nUnique Patterns: %lu\n\n", (unsigned long)gRawTotal,
+        (unsigned long)uniqueish);
+    ap("Protocol IDs:\n");
+    {
+      bool any = false;
+      for (uint8_t id = 1; id < SG_PROTO_COUNT; id++) {
+        if (!protoCount[id]) continue;
+        any = true;
+        apf("  %s: %lu\n", sgProtoName((SgProtoId)id), (unsigned long)protoCount[id]);
+      }
+      if (!any) ap("  (none classified yet)\n");
+    }
+    ap("\nMost Common Patterns:\n");
     // top 3 patterns by count
     for (int rank = 0; rank < 3; rank++) {
       int best = -1;
@@ -942,6 +1071,14 @@ bool subghzRawCommand(const char* args, char* out, size_t n) {
     hexAscii(bytes, nb, hex, sizeof hex, asc, sizeof asc);
     b64Encode(bytes, nb, b64, sizeof b64);
     apf("=== DECODING: %s ===\n\n", rawIn);
+    {
+      char idbuf[400];
+      // Assume 433 unless hex came from a tagged capture — caller can use raw id <mhz>
+      sgFormatIdentify(bytes, nb, 433.92f, true, idbuf, sizeof idbuf);
+      ap("--- PROTOCOL / BRAND ---\n");
+      ap(idbuf);
+      ap("\n");
+    }
     apf("ASCII: \"%s\"\n", asc);
     ap("Binary:");
     for (uint8_t i = 0; i < nb; i++) {
@@ -999,7 +1136,7 @@ bool subghzRawCommand(const char* args, char* out, size_t n) {
 
   int count = atoi(p);
   if (count < 1 || count > 50) {
-    ap("ERROR: count must be 1-50 (or last|filter|clear|save|decode|analyze)\n");
+    ap("ERROR: count must be 1-50 (or last|filter|clear|save|decode|analyze|id|protocols)\n");
     return false;
   }
   dumpList((uint32_t)count, 0, false);
